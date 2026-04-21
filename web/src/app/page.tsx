@@ -36,9 +36,10 @@ export default function Home() {
     if (!selectedRobot) return;
     setStage("matching");
 
+    const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
     try {
       const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_BASE_URL}/face/match`,
+        `${apiUrl}/face/match`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
