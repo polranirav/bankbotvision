@@ -1,0 +1,19 @@
+# Optional: a local Postgres for running api/tests/ without a hosted Supabase project.
+# For the real app, use Supabase (it provides Auth + Storage on top of Postgres).
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: bankbotvision-pg
+    environment:
+      POSTGRES_USER: bankbot
+      POSTGRES_PASSWORD: bankbot
+      POSTGRES_DB: bankbotvision
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+
+volumes:
+  pgdata:

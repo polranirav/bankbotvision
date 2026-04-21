@@ -1,0 +1,40 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+build/
+*.log
+.pnpm-store/
+.pnp.*
+.yarn/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Supabase local
+supabase/.temp/
+supabase/.branches/
