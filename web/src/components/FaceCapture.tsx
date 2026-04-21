@@ -61,8 +61,10 @@ export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
       if (!videoRef.current || videoRef.current.readyState < 2) return;
       const faceapi = (await import("face-api.js")).default ?? await import("face-api.js");
 
+      // Use TinyFaceDetector for the live loop — 5-10× faster than SSD MobileNet.
+      // Only SSD MobileNet is used at final capture for the full descriptor.
       const result = await faceapi
-        .detectSingleFace(videoRef.current, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.7 }))
+        .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.5 }))
         .withFaceLandmarks()
         .withFaceDescriptor();
 
@@ -76,7 +78,7 @@ export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
       drawOverlay(true, result.detection.box);
     };
 
-    intervalRef.current = setInterval(detect, 200);
+    intervalRef.current = setInterval(detect, 150);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [scanning]);
 
@@ -136,6 +138,16 @@ export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
 
   if (faceState === "error") {
     return <p className="text-red-600 text-sm">Failed to load face models.</p>;
+  }
+
+  if (faceState === "loading") {
+    return (
+      <div className="flex flex-col items-center gap-3 py-6">
+        <div className="w-8 h-8 border-2 border-neutral-300 border-t-neutral-800 rounded-full animate-spin" />
+        <p className="text-sm text-neutral-500">Loading face recognition models…</p>
+        <p className="text-xs text-neutral-400">(first load only — ~3 seconds)</p>
+      </div>
+    );
   }
 
   return (

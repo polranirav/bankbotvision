@@ -26,6 +26,9 @@ export function useFaceApi() {
         // Dynamically import so TensorFlow.js only loads client-side
         const faceapi = await import("face-api.js");
         const MODEL_URL = "/models";
+        // Load TinyFaceDetector first (190 KB) so the camera appears fast,
+        // then load the heavier models for landmarks + recognition in parallel.
+        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
         await Promise.all([
           faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
