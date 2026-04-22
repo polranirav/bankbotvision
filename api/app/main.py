@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,6 +10,17 @@ from .routers import auth as auth_router
 from .routers import face as face_router
 from .routers import health as health_router
 from .routers import voice as voice_router
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Show all bankbot.* logs (agent, voice, face) in the terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Set bankbot loggers to INFO
+for name in ("bankbot.agent", "bankbot.voice", "bankbot.face"):
+    logging.getLogger(name).setLevel(logging.INFO)
 
 app = FastAPI(title="BankBot Vision API", version="0.1.0")
 

@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # Face recognition (DeepFace)
     face_model: str = "Facenet512"        # Facenet512, VGG-Face, ArcFace, etc.
-    face_detector: str = "mediapipe"      # mediapipe, opencv, retinaface, mtcnn
+    face_detector: str = "retinaface"     # retinaface, opencv, mtcnn, ssd (mediapipe broken in v0.10+)
     face_match_threshold: float = 0.40    # cosine distance — lower = stricter
 
     @property
