@@ -3,6 +3,7 @@
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { createBrowserClient } from "@supabase/ssr";
 import { DisclaimerBanner } from "@/components/DisclaimerBanner";
 import { FaceCapture, type CaptureResult } from "@/components/FaceCapture";
 import { ROBOTS, type RobotDef } from "@/components/Robot";
@@ -62,6 +63,7 @@ export default function Home() {
   const listenRetryRef = useRef(0);
   const messagesRef = useRef<ChatMessage[]>([]);
 
+  const [authFirstName, setAuthFirstName] = useState<string | null>(null);
   const [selectedRobot, setSelectedRobot] = useState<RobotDef | null>(null);
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -96,6 +98,28 @@ export default function Home() {
       }
       if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
     };
+  }, []);
+
+  // ── Auth session ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const sb = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    );
+    sb.auth.getSession().then(async ({ data }) => {
+      if (!data.session) return;
+      // Pull first name from accounts table
+      const res = await sb
+        .from("accounts")
+        .select("first_name")
+        .eq("user_id", data.session.user.id)
+        .maybeSingle();
+      setAuthFirstName(res.data?.first_name ?? data.session.user.email?.split("@")[0] ?? "Account");
+    });
+    const { data: listener } = sb.auth.onAuthStateChange((_event, session) => {
+      if (!session) setAuthFirstName(null);
+    });
+    return () => listener.subscription.unsubscribe();
   }, []);
 
   const deskStates = useMemo(
@@ -220,20 +244,34 @@ export default function Home() {
 
   async function handleFaceCapture(result: CaptureResult) {
     if (!selectedRobot) return;
-
-    setCameraState("matching");
-    setSessionStage("identifying");
+    // If we've already matched or errored, stop processing new frames
+    if (cameraState === "matched" || cameraState === "error" || cameraState === "new") return;
 
     const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
     try {
-      const res = await fetch(`${apiUrl}/face/match`, {
+      const res = await fetch(`${apiUrl}/face/detect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ descriptor: result.descriptor }),
+        body: JSON.stringify({ image_data_url: result.imageDataUrl }),
       });
 
       if (!res.ok) {
+        throw new Error("Detection failed");
+      }
+
+      const data = await res.json();
+      
+      if (!data.detected) {
+        // No face found in this frame — keep waiting/polling
+        return;
+      }
+
+      // Face detected — stop polling by changing state
+      setCameraState("matching");
+      setSessionStage("identifying");
+
+      if (!data.matched) {
         setCameraState("new");
         setSessionStage("ready");
         setIdentityState("guest");
@@ -244,14 +282,13 @@ export default function Home() {
         return;
       }
 
-      const { first_name, magic_link } = await res.json();
-      setRecognisedName(first_name);
+      setRecognisedName(data.first_name);
       setIdentityState("confirming");
-      setPendingMagicLink(magic_link);
+      setPendingMagicLink(data.magic_link);
       setCameraState("matched");
       setSessionStage("ready");
       speakAgent(
-        `Hello. I think I recognised you as ${first_name}. Please tell me your first name so I can confirm, then I can help with balances, cards, documents, or account opening.`,
+        `Hello. I think I recognised you as ${data.first_name}. Please tell me your first name so I can confirm, then I can help with balances, cards, documents, or account opening.`,
         { autoListen: true },
       );
     } catch (error) {
@@ -498,6 +535,7 @@ export default function Home() {
 
       <header className="absolute inset-x-0 top-[37px] z-30">
         <div className="mx-auto flex w-full max-w-[1600px] items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
+          {/* Logo */}
           <div className="flex items-center gap-3 rounded-full border border-white/15 bg-slate-950/35 px-4 py-2 text-white backdrop-blur">
             <div className="flex h-9 w-9 items-center justify-center rounded-full bg-sky-500 text-lg">
               🏦
@@ -508,15 +546,49 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="hidden items-center gap-2 md:flex">
-            {deskStates.map(({ robot, label }, index) => (
-              <div
-                key={robot.name}
-                className="rounded-full border border-white/15 bg-slate-950/35 px-3 py-2 text-xs text-white backdrop-blur"
-              >
-                Desk {index + 1} · {robot.name} · {label}
-              </div>
-            ))}
+          {/* Auth nav */}
+          <div className="flex items-center gap-2">
+            {authFirstName ? (
+              <>
+                <button
+                  onClick={() => router.push("/account")}
+                  className="flex items-center gap-2 rounded-full border border-white/15 bg-slate-950/35 px-4 py-2 text-sm font-medium text-white backdrop-blur transition hover:bg-white/10"
+                >
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-sky-500 text-xs font-bold">
+                    {authFirstName[0].toUpperCase()}
+                  </span>
+                  {authFirstName}
+                </button>
+                <button
+                  onClick={async () => {
+                    const sb = createBrowserClient(
+                      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+                      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+                    );
+                    await sb.auth.signOut();
+                    setAuthFirstName(null);
+                  }}
+                  className="rounded-full border border-white/15 bg-slate-950/35 px-4 py-2 text-sm text-white/70 backdrop-blur transition hover:bg-white/10 hover:text-white"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => router.push("/signup")}
+                  className="rounded-full border border-white/15 bg-slate-950/35 px-4 py-2 text-sm font-medium text-white backdrop-blur transition hover:bg-white/10"
+                >
+                  Create account
+                </button>
+                <button
+                  onClick={() => router.push("/login")}
+                  className="rounded-full bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400"
+                >
+                  Sign in
+                </button>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -534,6 +606,37 @@ export default function Home() {
 
         <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-slate-950/75 via-slate-950/35 to-transparent" />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-56 bg-gradient-to-t from-slate-950 via-slate-950/65 to-transparent" />
+
+        {/* ── Desk name plates on the counter ── */}
+        <div
+          className={[
+            "pointer-events-none absolute inset-x-0 z-10 flex justify-around px-[8%] transition-opacity duration-500",
+            focusIndex === null ? "opacity-100" : "opacity-0",
+          ].join(" ")}
+          style={{ bottom: "29%" }}
+        >
+          {ROBOTS.map((robot) => (
+            <div key={robot.name} className="flex flex-col items-center gap-1">
+              {/* Name plate */}
+              <div
+                className="rounded-lg border px-5 py-1.5 backdrop-blur-sm"
+                style={{
+                  borderColor: `${robot.color}55`,
+                  backgroundColor: `${robot.color}18`,
+                }}
+              >
+                <p
+                  className="text-xs font-bold uppercase tracking-[0.28em]"
+                  style={{ color: robot.color }}
+                >
+                  {robot.name}
+                </p>
+              </div>
+              {/* Personality subtitle */}
+              <p className="text-[10px] tracking-wide text-white/40">{robot.personality}</p>
+            </div>
+          ))}
+        </div>
 
         {!sessionOpen && (
           <div className="pointer-events-none absolute inset-x-0 bottom-8 z-20 mx-auto w-full max-w-[1100px] px-4">
