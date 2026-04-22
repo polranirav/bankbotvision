@@ -7,6 +7,8 @@ POST /agent/frontdesk — spoken lobby intent understanding + routing decisions
 """
 from __future__ import annotations
 
+import logging
+import time
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException
@@ -14,12 +16,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
+from langsmith import traceable
 from pydantic import BaseModel
 from supabase import Client
 
 from ..config import settings
 from ..deps import get_current_user_id, get_supabase
 
+log = logging.getLogger("bankbot.agent")
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
@@ -586,7 +590,11 @@ def _rewrite_query(
     # Skip CQR for very short / already-clean inputs
     words = raw_question.split()
     if len(words) <= 8 and not history:
+        log.info("\n🔄 CQR: Skipped (short/clean input)")
         return raw_question
+
+    log.info("\n🔄 CQR: Rewriting messy input...")
+    log.info("   Raw: %r", raw_question)
 
     history_text = "\n".join(
         f"{'CUSTOMER' if t.role == 'user' else 'AGENT'}: {t.text}"
@@ -607,9 +615,10 @@ def _rewrite_query(
         rewritten = result.content.strip().strip('"').strip()
         # Sanity check: rewrite shouldn't be empty or way longer than original
         if rewritten and len(rewritten) < len(raw_question) * 3:
+            log.info("   Clean: %r", rewritten)
             return rewritten
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("   CQR failed: %s", e)
 
     return raw_question
 
@@ -872,6 +881,12 @@ def agent_query(
     - Authenticated: full banking tools scoped to the user
     - Unauthenticated: general banking assistant (no tools)
     """
+    t0 = time.time()
+    log.info("\n" + "═" * 60)
+    log.info("🤖 AGENT QUERY  robot=%s  history_turns=%d", payload.robot_name, len(payload.history))
+    log.info("   User said: %r", payload.question)
+    log.info("═" * 60)
+
     if not settings.openai_api_key:
         raise HTTPException(status_code=503, detail="OpenAI key not configured")
 
@@ -893,6 +908,7 @@ def agent_query(
             history_messages.append(HumanMessage(content=turn.text))
         else:
             history_messages.append(AIMessage(content=turn.text))
+    log.info("📜 History: %d turns loaded", len(history_messages))
 
     # ── Step 3: Try to authenticate ──────────────────────────────────────
     tools: list = []
@@ -901,32 +917,63 @@ def agent_query(
             user_id = get_current_user_id(authorization)
             sb = get_supabase()
             tools = _make_tools(user_id, sb)
+            log.info("🔐 Auth: user=%s  tools=%d", user_id[:8] + "…", len(tools))
         except HTTPException:
-            pass  # unauthenticated — continue without tools
-
-    # ── Step 4: Run agent or direct LLM ──────────────────────────────────
-    if tools:
-        # Authenticated: full agent with banking tools + history
-        agent = create_react_agent(llm, tools, prompt=system_prompt)
-        all_messages = history_messages + [HumanMessage(content=clean_query)]
-        result = agent.invoke({"messages": all_messages})
-        answer = result["messages"][-1].content
+            log.info("🔓 Auth: token invalid — running without tools")
     else:
-        # Unauthenticated: general banking assistant (no tools)
-        general_prompt = (
-            system_prompt
-            + " The visitor has not signed in yet, so you cannot access any "
-            "account data. Help with general banking questions, guide them to "
-            "sign in or open an account, and answer questions about BankBot "
-            "Vision services. Keep answers concise."
-        )
-        all_messages = (
-            [SystemMessage(content=general_prompt)]
-            + history_messages
-            + [HumanMessage(content=clean_query)]
-        )
-        result = llm.invoke(all_messages)
-        answer = result.content
+        log.info("🔓 Auth: no token — running without tools")
+
+    # ── Step 4: Run agent or direct LLM (wrapped for LangSmith) ─────────────
+    @traceable(
+        name=f"[{payload.robot_name}] {payload.question[:60]}",
+        run_type="chain",
+        tags=["banking", "agent", "authenticated" if tools else "guest"],
+        metadata={
+            "robot": payload.robot_name,
+            "question": payload.question,
+            "rewritten_query": clean_query,
+            "authenticated": bool(tools),
+            "tool_count": len(tools),
+        },
+    )
+    def _run_agent() -> str:
+        if tools:
+            tool_names = [t.name for t in tools]
+            log.info("🛠️  Tools available: %s", ", ".join(tool_names))
+            agent = create_react_agent(llm, tools, prompt=system_prompt)
+            all_messages = history_messages + [HumanMessage(content=clean_query)]
+            result = agent.invoke({"messages": all_messages})
+            tool_calls = [
+                msg for msg in result["messages"]
+                if hasattr(msg, "tool_calls") and msg.tool_calls
+            ]
+            if tool_calls:
+                for tc_msg in tool_calls:
+                    for tc in tc_msg.tool_calls:
+                        log.info("   🔧 Tool called: %s(%s)", tc["name"], str(tc.get("args", ""))[:80])
+            return result["messages"][-1].content
+        else:
+            log.info("💬 Mode: Direct LLM (no tools)")
+            general_prompt = (
+                system_prompt
+                + " The visitor has not signed in yet, so you cannot access any "
+                "account data. Help with general banking questions, guide them to "
+                "sign in or open an account, and answer questions about BankBot "
+                "Vision services. Keep answers concise."
+            )
+            all_messages = (
+                [SystemMessage(content=general_prompt)]
+                + history_messages
+                + [HumanMessage(content=clean_query)]
+            )
+            result = llm.invoke(all_messages)
+            return result.content
+
+    answer = _run_agent()
+
+    elapsed = time.time() - t0
+    log.info("\n✅ ANSWER (%.1fs): %s", elapsed, answer[:120] + ("…" if len(answer) > 120 else ""))
+    log.info("─" * 60)
 
     return QueryResponse(
         answer=answer,
@@ -934,38 +981,37 @@ def agent_query(
     )
 
 
-@router.post("/frontdesk", response_model=FrontDeskResponse)
-def frontdesk_query(payload: FrontDeskRequest) -> FrontDeskResponse:
-    """Understand a spoken lobby request and decide whether to keep talking or route."""
-    fallback = _fallback_frontdesk_response(payload)
+@traceable(
+    name="Frontdesk Conversation Turn",
+    run_type="chain",
+    tags=["frontdesk", "lobby"],
+)
+def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
+    """LLM decision — wrapped so LangSmith records the full utterance → reply turn."""
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        api_key=settings.openai_api_key,
+    )
+    structured_llm = llm.with_structured_output(FrontDeskResponse)
 
-    if not settings.openai_api_key:
-        return fallback
+    history_lines = "\n".join(
+        f"{msg.role.upper()}: {msg.text}" for msg in payload.history[-8:]
+    ) or "No prior conversation."
 
-    try:
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            api_key=settings.openai_api_key,
-        )
-        structured_llm = llm.with_structured_output(FrontDeskResponse)
+    recognized_context = (
+        f"Recognized name: {payload.recognised_name}. "
+        if payload.recognised_name
+        else "Recognized name: none. "
+    )
+    session_context = (
+        f"{recognized_context}"
+        f"Face match available: {payload.has_face_match}. "
+        f"Magic link ready: {payload.has_magic_link}."
+    )
 
-        history_lines = "\n".join(
-            f"{msg.role.upper()}: {msg.text}" for msg in payload.history[-8:]
-        ) or "No prior conversation."
-
-        recognized_context = (
-            f"Recognized name: {payload.recognised_name}. "
-            if payload.recognised_name
-            else "Recognized name: none. "
-        )
-        session_context = (
-            f"{recognized_context}"
-            f"Face match available: {payload.has_face_match}. "
-            f"Magic link ready: {payload.has_magic_link}."
-        )
-
-        decision = structured_llm.invoke([
+    decision = structured_llm.invoke(
+        [
             SystemMessage(content=_frontdesk_system_prompt(payload.robot_name)),
             HumanMessage(
                 content=(
@@ -974,8 +1020,40 @@ def frontdesk_query(payload: FrontDeskRequest) -> FrontDeskResponse:
                     f"Latest visitor utterance:\n{payload.utterance}"
                 )
             ),
-        ])
+        ],
+        config={
+            "run_name": f"[{payload.robot_name}] {payload.utterance[:60]}",
+            "metadata": {
+                "robot": payload.robot_name,
+                "visitor": payload.recognised_name or "guest",
+                "face_match": payload.has_face_match,
+                "utterance": payload.utterance,
+            },
+        },
+    )
+    return _normalize_frontdesk_decision(decision, payload)
 
-        return _normalize_frontdesk_decision(decision, payload)
-    except Exception:
+
+@router.post("/frontdesk", response_model=FrontDeskResponse)
+def frontdesk_query(payload: FrontDeskRequest) -> FrontDeskResponse:
+    """Understand a spoken lobby request and decide whether to keep talking or route."""
+    log.info("\n" + "═" * 60)
+    log.info("🏦 FRONTDESK  robot=%s  recognised=%s", payload.robot_name, payload.recognised_name or "none")
+    log.info("   Visitor said: %r", payload.utterance)
+    log.info("═" * 60)
+
+    fallback = _fallback_frontdesk_response(payload)
+
+    if not settings.openai_api_key:
+        log.info("   ⚠️  No OpenAI key — using keyword fallback")
+        return fallback
+
+    try:
+        result = _frontdesk_llm_call(payload)
+        log.info("   🎯 Decision: route=%s  should_route=%s", result.route_target, result.should_route)
+        log.info("   💬 Reply: %r", result.reply[:100])
+        log.info("─" * 60)
+        return result
+    except Exception as e:
+        log.warning("   ❌ Frontdesk LLM failed: %s — using fallback", e)
         return fallback

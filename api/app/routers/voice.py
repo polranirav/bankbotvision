@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
+from langsmith import traceable
 from pydantic import BaseModel
 
 from ..config import settings
@@ -125,50 +126,50 @@ class TranscribeResponse(BaseModel):
     engine: str = "unknown"   # which engine was actually used
 
 
+@traceable(name="STT Transcription", run_type="chain")
+def _run_transcription(audio_bytes: bytes, extension: str) -> dict:
+    """Inner transcription logic — wrapped so LangSmith records the audio size,
+    engine used, and the resulting transcript text."""
+    engine = settings.stt_engine.lower().strip()
+
+    if engine == "local":
+        text = _transcribe_local(audio_bytes, extension)
+        return {"transcript": text, "engine": "faster-whisper", "audio_bytes": len(audio_bytes)}
+
+    if engine == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OpenAI key not configured")
+        text = _transcribe_openai(audio_bytes, extension)
+        return {"transcript": text, "engine": "openai-whisper", "audio_bytes": len(audio_bytes)}
+
+    # auto — local first, fallback to openai
+    try:
+        text = _transcribe_local(audio_bytes, extension)
+        return {"transcript": text, "engine": "faster-whisper", "audio_bytes": len(audio_bytes)}
+    except Exception as local_err:
+        log.info("Local STT failed (%s), falling back to OpenAI", local_err)
+        if not settings.openai_api_key:
+            raise RuntimeError("Local STT unavailable and no OpenAI key configured")
+        text = _transcribe_openai(audio_bytes, extension)
+        return {"transcript": text, "engine": "openai-whisper", "audio_bytes": len(audio_bytes)}
+
+
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(file: UploadFile = File(...)) -> TranscribeResponse:
-    """Accept a WebM/OGG/MP4 audio blob and return the transcript.
-
-    Engine selection via STT_ENGINE env var:
-      local  — Faster-Whisper (free, local, best for accented speech)
-      openai — OpenAI Whisper API (requires OPENAI_API_KEY)
-      auto   — tries local first, falls back to openai
-    """
+    """Accept a WebM/OGG/MP4 audio blob and return the transcript."""
     audio_bytes = await file.read()
     if len(audio_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Audio too short — nothing to transcribe")
 
     extension = (file.filename or "audio.webm").rsplit(".", 1)[-1] or "webm"
-    engine = settings.stt_engine.lower().strip()
 
-    # ── Local engine ──────────────────────────────────────────────────────
-    if engine == "local":
-        try:
-            text = _transcribe_local(audio_bytes, extension)
-            return TranscribeResponse(text=text, engine="faster-whisper")
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Local STT failed: {e}")
-
-    # ── OpenAI engine ─────────────────────────────────────────────────────
-    if engine == "openai":
-        if not settings.openai_api_key:
-            raise HTTPException(status_code=503, detail="OpenAI key not configured")
-        text = _transcribe_openai(audio_bytes, extension)
-        return TranscribeResponse(text=text, engine="openai-whisper")
-
-    # ── Auto: try local first, fall back to openai ────────────────────────
     try:
-        text = _transcribe_local(audio_bytes, extension)
-        return TranscribeResponse(text=text, engine="faster-whisper")
-    except Exception as local_err:
-        log.info("Local STT failed (%s), falling back to OpenAI", local_err)
-        if not settings.openai_api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="Local STT unavailable and no OpenAI key configured",
-            )
-        text = _transcribe_openai(audio_bytes, extension)
-        return TranscribeResponse(text=text, engine="openai-whisper")
+        result = _run_transcription(audio_bytes, extension)
+        return TranscribeResponse(text=result["transcript"], engine=result["engine"])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"STT failed: {e}")
 
 
 # ── Speak endpoint ────────────────────────────────────────────────────────────
