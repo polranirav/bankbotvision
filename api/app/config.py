@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     face_detector: str = "retinaface"     # retinaface, opencv, mtcnn, ssd (mediapipe broken in v0.10+)
     face_match_threshold: float = 0.40    # cosine distance — lower = stricter
 
+    # LangSmith tracing (LangChain reads these directly from os.environ)
+    langchain_tracing_v2: str = "false"
+    langchain_endpoint: str = "https://api.smith.langchain.com"
+    langchain_api_key: str = ""
+    langchain_project: str = "bankbotvision"
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]

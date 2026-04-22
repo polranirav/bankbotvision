@@ -1,9 +1,19 @@
 import logging
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
+
+# ── LangSmith tracing — must be set in os.environ before LangChain imports ───
+# pydantic-settings loads .env but LangChain reads os.environ directly.
+if settings.langchain_api_key:
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", settings.langchain_tracing_v2)
+    os.environ.setdefault("LANGCHAIN_ENDPOINT", settings.langchain_endpoint)
+    os.environ.setdefault("LANGCHAIN_API_KEY", settings.langchain_api_key)
+    os.environ.setdefault("LANGCHAIN_PROJECT", settings.langchain_project)
+
 from .routers import accounts as accounts_router
 from .routers import agent as agent_router
 from .routers import auth as auth_router
