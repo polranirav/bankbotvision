@@ -533,7 +533,7 @@ export default function Home() {
     <div className="min-h-screen bg-[#eaf1f7] text-slate-950">
       <DisclaimerBanner />
 
-      <header className="absolute inset-x-0 top-[37px] z-30">
+      <header className="absolute inset-x-0 top-[37px] z-50">
         <div className="mx-auto flex w-full max-w-[1600px] items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
           {/* Logo */}
           <div className="flex items-center gap-3 rounded-full border border-white/15 bg-slate-950/35 px-4 py-2 text-white backdrop-blur">

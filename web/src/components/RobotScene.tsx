@@ -2,7 +2,7 @@
 
 import { useRef } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
-import { ContactShadows, Environment } from "@react-three/drei";
+import { ContactShadows } from "@react-three/drei";
 import * as THREE from "three";
 import { Robot, Desk, ROBOTS, type RobotDef } from "./Robot";
 import { Suspense } from "react";
@@ -144,7 +144,6 @@ function SceneContent({ onSelectRobot, focusIndex, speakingIndex }: SceneProps) 
       <pointLight position={[-6, 3, 2]} intensity={0.4} color="#60a5fa" />
       <pointLight position={[ 6, 3, 2]} intensity={0.4} color="#a78bfa" />
 
-      <Environment preset="city" />
       <ContactShadows position={[0, -1.28, 0]} opacity={0.5} scale={20} blur={2.5} far={5} />
 
       <LobbyFloor />
