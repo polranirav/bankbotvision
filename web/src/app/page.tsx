@@ -88,6 +88,15 @@ export default function Home() {
     setSpeechSupported(typeof window !== "undefined" && "MediaRecorder" in window);
   }, []);
 
+  // Pre-load speech synthesis voices so first speak() call isn't silent
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const load = () => window.speechSynthesis.getVoices();
+    load();
+    window.speechSynthesis.onvoiceschanged = load;
+    return () => { window.speechSynthesis.onvoiceschanged = null; };
+  }, []);
+
   useEffect(() => {
     return () => {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
@@ -169,12 +178,36 @@ export default function Home() {
     }
 
     window.speechSynthesis.cancel();
+    if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1;
     utterance.pitch = selectedRobot?.name === "ZED" ? 0.9 : 1.03;
-    utterance.onend = () => finishAgentAction(action);
-    utterance.onerror = () => finishAgentAction(action);
+
+    // Safety net: always fire finishAgentAction even if onend never fires
+    // (Chrome sometimes silently drops speech when user-gesture chain is broken)
+    const estimatedMs = Math.max(2500, text.length * 65);
+    let fired = false;
+    const done = () => {
+      if (fired) return;
+      fired = true;
+      if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
+      finishAgentAction(action);
+    };
+
+    utterance.onend = done;
+    utterance.onerror = done;
+    speechTimeoutRef.current = setTimeout(done, estimatedMs);
+
+    // Chrome macOS bug: speech synthesis pauses if not nudged
+    const resumeInterval = setInterval(() => {
+      if (!window.speechSynthesis.speaking) { clearInterval(resumeInterval); return; }
+      window.speechSynthesis.pause();
+      window.speechSynthesis.resume();
+    }, 5000);
+    utterance.onend = () => { clearInterval(resumeInterval); done(); };
+    utterance.onerror = () => { clearInterval(resumeInterval); done(); };
+
     window.speechSynthesis.speak(utterance);
   }
 
@@ -205,11 +238,14 @@ export default function Home() {
     setSessionError("");
     setLobbyStatus(`${robot.name} is greeting you at Desk ${index + 1}.`);
 
-    await requestMicrophone();
-
+    // Speak FIRST — must happen synchronously within the click gesture.
+    // Any await before this breaks Chrome's user-gesture chain for Web Speech API.
     speakAgent(
-      `Hello, welcome to BankBot Vision. I'm ${robot.name}. Let me see your face first, and then tell me how I can help you today.`,
+      `Hello! Welcome to BankBot Vision. I'm ${robot.name}. Let me scan your face, then tell me how I can help you today.`,
     );
+
+    // Request mic after — this await is safe because speech is already unlocked above.
+    await requestMicrophone();
   }
 
   function handleSelectRobot(robot: RobotDef, index: number) {
