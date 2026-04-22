@@ -1,54 +1,177 @@
 """Phase 4 — Voice pipeline.
 
-POST /voice/transcribe  — audio blob → text (Whisper via OpenAI)
+POST /voice/transcribe  — audio blob → text
+                          Supports two engines:
+                          • local  — Faster-Whisper (free, no API, handles accents)
+                          • openai — OpenAI Whisper API (cloud)
+                          • auto   — tries local first, falls back to openai
 POST /voice/speak       — text → MP3 audio stream (ElevenLabs)
 """
 from __future__ import annotations
 
+import io
+import logging
+import tempfile
+from pathlib import Path
+
 import httpx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
-from openai import OpenAI
 from pydantic import BaseModel
 
 from ..config import settings
 
 router = APIRouter(prefix="/voice", tags=["voice"])
-
-_openai: OpenAI | None = None
-
-
-def _get_openai() -> OpenAI:
-    global _openai
-    if _openai is None:
-        _openai = OpenAI(api_key=settings.openai_api_key)
-    return _openai
+log = logging.getLogger("bankbot.voice")
 
 
-# ── Transcribe ────────────────────────────────────────────────────────────────
+# ── Lazy singletons ──────────────────────────────────────────────────────────
+
+_openai_client = None
+_whisper_model = None
+_whisper_load_failed = False
+
+
+def _get_openai():
+    """Lazy-load the OpenAI client."""
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=settings.openai_api_key)
+    return _openai_client
+
+
+def _get_whisper_model():
+    """Lazy-load Faster-Whisper model (downloads weights on first call)."""
+    global _whisper_model, _whisper_load_failed
+    if _whisper_load_failed:
+        return None
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+        log.info(
+            "Loading Faster-Whisper model=%s device=%s compute=%s …",
+            settings.faster_whisper_model,
+            settings.faster_whisper_device,
+            settings.faster_whisper_compute,
+        )
+        _whisper_model = WhisperModel(
+            settings.faster_whisper_model,
+            device=settings.faster_whisper_device,
+            compute_type=settings.faster_whisper_compute,
+        )
+        log.info("Faster-Whisper model loaded successfully.")
+        return _whisper_model
+    except Exception as e:
+        log.warning("Faster-Whisper failed to load: %s — will use OpenAI fallback", e)
+        _whisper_load_failed = True
+        return None
+
+
+# ── Local transcription (Faster-Whisper) ─────────────────────────────────────
+
+def _transcribe_local(audio_bytes: bytes, extension: str) -> str:
+    """Transcribe audio using Faster-Whisper running locally."""
+    model = _get_whisper_model()
+    if model is None:
+        raise RuntimeError("Faster-Whisper not available")
+
+    # Faster-Whisper needs a file path, so write to a temp file
+    suffix = f".{extension}" if extension else ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        segments, info = model.transcribe(
+            tmp_path,
+            beam_size=5,
+            language="en",         # constrain to English for speed
+            vad_filter=True,       # skip silence segments
+            vad_parameters=dict(
+                min_silence_duration_ms=500,
+            ),
+        )
+        # Collect all segments into final text
+        text_parts = [segment.text.strip() for segment in segments]
+        transcript = " ".join(text_parts).strip()
+        log.info(
+            "Local transcription: lang=%s prob=%.2f duration=%.1fs → %d chars",
+            info.language, info.language_probability,
+            info.duration, len(transcript),
+        )
+        return transcript
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# ── Cloud transcription (OpenAI Whisper) ─────────────────────────────────────
+
+def _transcribe_openai(audio_bytes: bytes, extension: str) -> str:
+    """Transcribe audio using the OpenAI Whisper API."""
+    client = _get_openai()
+    transcript = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=(f"audio.{extension}", audio_bytes, f"audio/{extension}"),
+    )
+    return transcript.text.strip()
+
+
+# ── Transcribe endpoint ──────────────────────────────────────────────────────
 
 class TranscribeResponse(BaseModel):
     text: str
+    engine: str = "unknown"   # which engine was actually used
 
 
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(file: UploadFile = File(...)) -> TranscribeResponse:
-    """Accept a WebM/OGG/MP4 audio blob and return the Whisper transcript."""
+    """Accept a WebM/OGG/MP4 audio blob and return the transcript.
+
+    Engine selection via STT_ENGINE env var:
+      local  — Faster-Whisper (free, local, best for accented speech)
+      openai — OpenAI Whisper API (requires OPENAI_API_KEY)
+      auto   — tries local first, falls back to openai
+    """
     audio_bytes = await file.read()
     if len(audio_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Audio too short — nothing to transcribe")
 
-    client = _get_openai()
-    # Whisper needs a filename with an accepted extension so it knows the codec
     extension = (file.filename or "audio.webm").rsplit(".", 1)[-1] or "webm"
-    transcript = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=(f"audio.{extension}", audio_bytes, file.content_type or "audio/webm"),
-    )
-    return TranscribeResponse(text=transcript.text.strip())
+    engine = settings.stt_engine.lower().strip()
+
+    # ── Local engine ──────────────────────────────────────────────────────
+    if engine == "local":
+        try:
+            text = _transcribe_local(audio_bytes, extension)
+            return TranscribeResponse(text=text, engine="faster-whisper")
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Local STT failed: {e}")
+
+    # ── OpenAI engine ─────────────────────────────────────────────────────
+    if engine == "openai":
+        if not settings.openai_api_key:
+            raise HTTPException(status_code=503, detail="OpenAI key not configured")
+        text = _transcribe_openai(audio_bytes, extension)
+        return TranscribeResponse(text=text, engine="openai-whisper")
+
+    # ── Auto: try local first, fall back to openai ────────────────────────
+    try:
+        text = _transcribe_local(audio_bytes, extension)
+        return TranscribeResponse(text=text, engine="faster-whisper")
+    except Exception as local_err:
+        log.info("Local STT failed (%s), falling back to OpenAI", local_err)
+        if not settings.openai_api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Local STT unavailable and no OpenAI key configured",
+            )
+        text = _transcribe_openai(audio_bytes, extension)
+        return TranscribeResponse(text=text, engine="openai-whisper")
 
 
-# ── Speak ─────────────────────────────────────────────────────────────────────
+# ── Speak endpoint ────────────────────────────────────────────────────────────
 
 class SpeakRequest(BaseModel):
     text: str

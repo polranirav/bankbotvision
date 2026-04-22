@@ -13,6 +13,17 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
 
+    # STT engine: "local" (Faster-Whisper), "openai" (API), or "auto" (local→openai fallback)
+    stt_engine: str = "auto"
+    faster_whisper_model: str = "large-v3"   # tiny, base, small, medium, large-v3
+    faster_whisper_device: str = "cpu"        # cpu or cuda
+    faster_whisper_compute: str = "int8"      # int8, float16, float32
+
+    # Face recognition (DeepFace)
+    face_model: str = "Facenet512"        # Facenet512, VGG-Face, ArcFace, etc.
+    face_detector: str = "mediapipe"      # mediapipe, opencv, retinaface, mtcnn
+    face_match_threshold: float = 0.40    # cosine distance — lower = stricter
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.api_cors_origins.split(",") if o.strip()]

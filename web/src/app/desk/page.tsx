@@ -209,10 +209,22 @@ export default function DeskPage() {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
+      // Build conversation history from AI messages for multi-turn context
+      const history = messages
+        .filter((m) => m.isAI || m.role === "customer")
+        .map((m) => ({
+          role: m.role === "customer" ? "user" : "assistant",
+          text: m.text,
+        }));
+
       const res = await fetch(`${API_URL}/agent/query`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ question: text, robot_name: selectedRobot.name }),
+        body: JSON.stringify({
+          question: text,
+          robot_name: selectedRobot.name,
+          history,
+        }),
       });
 
       if (!res.ok) {
@@ -238,7 +250,7 @@ export default function DeskPage() {
       ]);
       setChatStatus("idle");
     }
-  }, [token, selectedRobot, playTTS]);
+  }, [token, selectedRobot, playTTS, messages]);
 
   // ── Handle text form submit ───────────────────────────────────────────────
   function handleSendText(e: React.FormEvent) {

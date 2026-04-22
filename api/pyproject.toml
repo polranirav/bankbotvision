@@ -17,6 +17,10 @@ dependencies = [
     "langchain-openai>=1.1.16",
     "langchain-community>=0.4.1",
     "python-multipart>=0.0.26",
+    "faster-whisper>=1.1.0",
+    "deepface>=0.0.93",
+    "mediapipe>=0.10.18",
+    "tf-keras>=2.19",
 ]
 
 [project.optional-dependencies]

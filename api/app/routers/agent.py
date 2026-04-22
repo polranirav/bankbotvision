@@ -1,14 +1,16 @@
 """Phase 4 — LangChain banking agent.
 
-POST /agent/query   — natural-language question → answer string
-                      uses tool-calling with 4 banking tools scoped to current_user
+POST /agent/query     — natural-language question → answer string
+                        uses tool-calling with banking tools scoped to current_user
+                        supports conversation history and contextual query rewriting
+POST /agent/frontdesk — spoken lobby intent understanding + routing decisions
 """
 from __future__ import annotations
 
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -23,13 +25,21 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 # ── Request / Response ────────────────────────────────────────────────────────
 
+class ChatTurn(BaseModel):
+    """A single turn in the desk conversation."""
+    role: Literal["user", "assistant"]
+    text: str
+
+
 class QueryRequest(BaseModel):
     question: str
-    robot_name: str = "ARIA"    # for personalising the system prompt tone
+    robot_name: str = "ARIA"
+    history: list[ChatTurn] = []   # prior turns for multi-turn context
 
 
 class QueryResponse(BaseModel):
     answer: str
+    rewritten_query: str | None = None   # the cleaned query (for debugging / UX)
 
 
 class DeskMessage(BaseModel):
@@ -513,26 +523,95 @@ _TOOL_GUIDANCE = (
     "pay_credit_card. Always use Canadian dollar formatting."
 )
 
+_CONVERSATION_GUIDANCE = (
+    " You are in a multi-turn conversation. The customer may ask follow-up "
+    "questions that reference prior answers. Resolve pronouns and references "
+    "using the conversation context: 'it', 'that', 'the other one', "
+    "'what about savings' etc. If the customer asks multiple things in one "
+    "message, answer ALL of them — call multiple tools if needed. If the "
+    "question is ambiguous, ask ONE short clarifying question instead of "
+    "guessing. Never repeat information the customer already received "
+    "unless they explicitly ask again."
+)
+
 _ROBOT_SYSTEM: dict[str, str] = {
     "ARIA": (
         "You are ARIA, a friendly and warm AI bank assistant for BankBot Vision. "
         "Speak in a warm, encouraging, first-name-familiar tone. "
         "Keep answers concise — 2-3 sentences unless the user asks for more detail."
-        + _TOOL_GUIDANCE
+        + _TOOL_GUIDANCE + _CONVERSATION_GUIDANCE
     ),
     "MAX": (
         "You are MAX, a fast and precise AI bank assistant for BankBot Vision. "
         "Be direct, factual, and efficient — bullet-point style is fine."
-        + _TOOL_GUIDANCE
+        + _TOOL_GUIDANCE + _CONVERSATION_GUIDANCE
     ),
     "ZED": (
         "You are ZED, a calm and analytical AI bank assistant for BankBot Vision. "
         "Speak with measured confidence. Offer a brief analytical insight where relevant."
-        + _TOOL_GUIDANCE
+        + _TOOL_GUIDANCE + _CONVERSATION_GUIDANCE
     ),
 }
 
 DEFAULT_SYSTEM = _ROBOT_SYSTEM["ARIA"]
+
+
+# ── Contextual Query Rewriting (CQR) ─────────────────────────────────────────
+
+_CQR_PROMPT = (
+    "You are a query understanding module for a banking voice assistant. "
+    "The customer's speech may be unclear, rambling, or contain filler words. "
+    "Your job is to compress their utterance into ONE clean, precise query "
+    "that a banking agent can act on.\n\n"
+    "Rules:\n"
+    "1. Remove filler words (um, uh, like, you know, so).\n"
+    "2. Resolve pronouns using conversation history ('it' → 'my savings balance').\n"
+    "3. If the customer asks multiple things, combine into one compound query.\n"
+    "4. Preserve the customer's actual intent — do NOT add things they didn't ask.\n"
+    "5. Keep the rewrite SHORT — one sentence, max two.\n"
+    "6. If the speech is already clean and clear, return it mostly unchanged.\n"
+)
+
+
+def _rewrite_query(
+    raw_question: str,
+    history: list[ChatTurn],
+    llm: ChatOpenAI,
+) -> str:
+    """Compress messy speech into a clean query using conversation context.
+
+    Returns the original question unchanged if rewriting fails or the
+    input is already short and clean.
+    """
+    # Skip CQR for very short / already-clean inputs
+    words = raw_question.split()
+    if len(words) <= 8 and not history:
+        return raw_question
+
+    history_text = "\n".join(
+        f"{'CUSTOMER' if t.role == 'user' else 'AGENT'}: {t.text}"
+        for t in history[-6:]  # last 6 turns max
+    ) or "No prior conversation."
+
+    try:
+        result = llm.invoke([
+            SystemMessage(content=_CQR_PROMPT),
+            HumanMessage(
+                content=(
+                    f"Conversation so far:\n{history_text}\n\n"
+                    f"Latest customer utterance:\n\"{raw_question}\"\n\n"
+                    f"Rewritten query:"
+                )
+            ),
+        ])
+        rewritten = result.content.strip().strip('"').strip()
+        # Sanity check: rewrite shouldn't be empty or way longer than original
+        if rewritten and len(rewritten) < len(raw_question) * 3:
+            return rewritten
+    except Exception:
+        pass
+
+    return raw_question
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -787,15 +866,35 @@ def agent_query(
 ) -> QueryResponse:
     """Run the banking agent and return a natural-language answer.
 
-    Authenticated callers get full banking tools scoped to their account.
-    Unauthenticated callers get a general-purpose banking assistant.
+    Features:
+    - Contextual Query Rewriting (CQR): messy speech → clean query
+    - Multi-turn memory: conversation history informs follow-ups
+    - Authenticated: full banking tools scoped to the user
+    - Unauthenticated: general banking assistant (no tools)
     """
     if not settings.openai_api_key:
         raise HTTPException(status_code=503, detail="OpenAI key not configured")
 
     system_prompt = _ROBOT_SYSTEM.get(payload.robot_name.upper(), DEFAULT_SYSTEM)
 
-    # Try to authenticate — if it fails, fall back to general mode
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        api_key=settings.openai_api_key,
+    )
+
+    # ── Step 1: Contextual Query Rewriting ────────────────────────────────
+    clean_query = _rewrite_query(payload.question, payload.history, llm)
+
+    # ── Step 2: Build conversation history as LangChain messages ─────────
+    history_messages: list[HumanMessage | AIMessage] = []
+    for turn in payload.history[-10:]:  # cap at last 10 turns
+        if turn.role == "user":
+            history_messages.append(HumanMessage(content=turn.text))
+        else:
+            history_messages.append(AIMessage(content=turn.text))
+
+    # ── Step 3: Try to authenticate ──────────────────────────────────────
     tools: list = []
     if authorization and authorization.lower().startswith("bearer "):
         try:
@@ -805,16 +904,12 @@ def agent_query(
         except HTTPException:
             pass  # unauthenticated — continue without tools
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        api_key=settings.openai_api_key,
-    )
-
+    # ── Step 4: Run agent or direct LLM ──────────────────────────────────
     if tools:
-        # Authenticated: full agent with banking tools
+        # Authenticated: full agent with banking tools + history
         agent = create_react_agent(llm, tools, prompt=system_prompt)
-        result = agent.invoke({"messages": [HumanMessage(content=payload.question)]})
+        all_messages = history_messages + [HumanMessage(content=clean_query)]
+        result = agent.invoke({"messages": all_messages})
         answer = result["messages"][-1].content
     else:
         # Unauthenticated: general banking assistant (no tools)
@@ -825,13 +920,18 @@ def agent_query(
             "sign in or open an account, and answer questions about BankBot "
             "Vision services. Keep answers concise."
         )
-        result = llm.invoke([
-            SystemMessage(content=general_prompt),
-            HumanMessage(content=payload.question),
-        ])
+        all_messages = (
+            [SystemMessage(content=general_prompt)]
+            + history_messages
+            + [HumanMessage(content=clean_query)]
+        )
+        result = llm.invoke(all_messages)
         answer = result.content
 
-    return QueryResponse(answer=answer)
+    return QueryResponse(
+        answer=answer,
+        rewritten_query=clean_query if clean_query != payload.question else None,
+    )
 
 
 @router.post("/frontdesk", response_model=FrontDeskResponse)

@@ -58,7 +58,6 @@ export default function SignupPage() {
       await api("/face/save", {
         method: "POST",
         body: JSON.stringify({
-          descriptor: result.descriptor,
           image_data_url: result.imageDataUrl,
         }),
       });

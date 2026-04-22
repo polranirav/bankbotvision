@@ -37,22 +37,34 @@ export default function LoginPage() {
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/face/match`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/face/detect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ descriptor: result.descriptor }),
+        body: JSON.stringify({ image_data_url: result.imageDataUrl }),
       });
 
       if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: "Face not recognised" }));
-        setError(body.detail ?? "Face not recognised");
+        const body = await res.json().catch(() => ({ detail: "Face detection failed" }));
+        setError(body.detail ?? "Face detection failed");
         setMode("choose");
         return;
       }
 
-      const { magic_link } = await res.json();
+      const data = await res.json();
+      if (!data.detected) {
+        // Just let it keep trying if it didn't find a face
+        setBusy(false);
+        return;
+      }
+
+      if (!data.matched) {
+        setError("Face not recognised. Please try again or use email.");
+        setMode("choose");
+        return;
+      }
+
       // Follow the magic link — Supabase sets the session cookie then redirects back
-      window.location.href = magic_link;
+      window.location.href = data.magic_link;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMode("choose");
