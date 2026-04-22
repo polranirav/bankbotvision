@@ -1,15 +1,15 @@
 "use client";
 
 /**
- * FaceCapture — simple webcam component.
+ * FaceCapture — webcam component with live face-api.js detection overlay.
  *
- * All face ML (detection, embedding, matching) now runs on the server via
- * DeepFace. This component just shows the camera feed and captures a JPEG
- * frame to send to the API.
+ * face-api.js runs in the browser and draws a bounding box so the user can
+ * see their face is detected before capturing.  All actual face embedding /
+ * identity matching still happens server-side via DeepFace.
  *
- * matchOnly=false  → manual "Capture" button (signup flow)
+ * matchOnly=false  → manual "Capture" button (account set-up flow)
  * matchOnly=true   → auto-captures every 2.5 s and fires onCapture (lobby)
- * minimal=true     → no visible UI (just runs the capture loop in background)
+ * minimal=true     → no visible UI, just runs the capture loop in background
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -25,6 +25,27 @@ type Props = {
   minimal?: boolean;
 };
 
+// ── face-api.js model loading (lazy, once per page load) ─────────────────────
+let faceApiLoaded = false;
+let faceApiLoading = false;
+
+async function loadFaceApi() {
+  if (faceApiLoaded || faceApiLoading) return;
+  faceApiLoading = true;
+  try {
+    const faceapi = await import("face-api.js");
+    const MODEL_URL = "/models";
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+    ]);
+    faceApiLoaded = true;
+  } catch (e) {
+    console.warn("face-api.js failed to load:", e);
+  } finally {
+    faceApiLoading = false;
+  }
+}
+
 export function FaceCapture({
   onCapture,
   onError,
@@ -32,14 +53,26 @@ export function FaceCapture({
   minimal = false,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const capturedRef = useRef(false);
 
   const [status, setStatus] = useState("Starting camera…");
   const [cameraReady, setCameraReady] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [modelsReady, setModelsReady] = useState(false);
 
-  // ── Start camera ────────────────────────────────────────────────────────
+  // ── Load face-api.js models ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (minimal) return; // skip overlay in minimal mode
+    loadFaceApi().then(() => {
+      if (faceApiLoaded) setModelsReady(true);
+    });
+  }, [minimal]);
+
+  // ── Start camera ─────────────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
     navigator.mediaDevices
@@ -69,11 +102,85 @@ export function FaceCapture({
     };
   }, [matchOnly, onError]);
 
-  // ── Auto-capture loop (matchOnly) ────────────────────────────────────────
+  // ── Live face detection overlay ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!cameraReady || !modelsReady || minimal) return;
+
+    const run = async () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState < 2) return;
+
+      try {
+        const faceapi = await import("face-api.js");
+        const detection = await faceapi.detectSingleFace(
+          video,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.45 })
+        );
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (detection) {
+          setFaceDetected(true);
+          if (!capturedRef.current) {
+            setStatus(matchOnly ? "Face detected — matching…" : "Face detected ✓ — click Capture");
+          }
+
+          // Mirror the bounding box (video is CSS-mirrored with scaleX(-1))
+          const { x, y, width, height } = detection.box;
+          const mirroredX = canvas.width - x - width;
+
+          // Draw glowing bounding box
+          ctx.shadowColor = "#22d3ee";
+          ctx.shadowBlur = 12;
+          ctx.strokeStyle = "#22d3ee";
+          ctx.lineWidth = 2.5;
+          ctx.strokeRect(mirroredX, y, width, height);
+
+          // Corner accents
+          const corner = Math.min(width, height) * 0.18;
+          ctx.shadowBlur = 0;
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 3;
+          const drawCorner = (cx: number, cy: number, dx: number, dy: number) => {
+            ctx.beginPath();
+            ctx.moveTo(cx + dx * corner, cy);
+            ctx.lineTo(cx, cy);
+            ctx.lineTo(cx, cy + dy * corner);
+            ctx.stroke();
+          };
+          drawCorner(mirroredX, y, 1, 1);
+          drawCorner(mirroredX + width, y, -1, 1);
+          drawCorner(mirroredX, y + height, 1, -1);
+          drawCorner(mirroredX + width, y + height, -1, -1);
+
+          // Confidence label
+          ctx.font = "11px monospace";
+          ctx.fillStyle = "#22d3ee";
+          ctx.fillText(`${Math.round(detection.score * 100)}%`, mirroredX + 4, y - 6);
+        } else {
+          setFaceDetected(false);
+          if (!capturedRef.current) {
+            setStatus(matchOnly ? "Looking for you…" : "Position your face in the frame");
+          }
+        }
+      } catch {
+        // detection errors are non-fatal — just skip the frame
+      }
+    };
+
+    detectionRef.current = setInterval(run, 180);
+    return () => {
+      if (detectionRef.current) clearInterval(detectionRef.current);
+    };
+  }, [cameraReady, modelsReady, matchOnly, minimal]);
+
+  // ── Auto-capture loop (matchOnly) ────────────────────────────────────────────
   useEffect(() => {
     if (!matchOnly || !cameraReady) return;
 
-    // Fire first capture right away, then every 2.5 s
     const capture = () => {
       const video = videoRef.current;
       if (!video || video.readyState < 2) return;
@@ -84,7 +191,6 @@ export function FaceCapture({
       onCapture({ imageDataUrl: snap.toDataURL("image/jpeg", 0.85) });
     };
 
-    // Small initial delay so the camera has a frame
     const init = setTimeout(capture, 800);
     intervalRef.current = setInterval(capture, 2500);
 
@@ -94,7 +200,7 @@ export function FaceCapture({
     };
   }, [matchOnly, cameraReady, onCapture]);
 
-  // ── Manual capture (signup) ──────────────────────────────────────────────
+  // ── Manual capture ────────────────────────────────────────────────────────────
   const captureManual = useCallback(() => {
     const video = videoRef.current;
     if (!video || capturedRef.current) return;
@@ -106,11 +212,15 @@ export function FaceCapture({
     snap.getContext("2d")?.drawImage(video, 0, 0);
 
     streamRef.current?.getTracks().forEach((t) => t.stop());
+    if (detectionRef.current) clearInterval(detectionRef.current);
+    const canvas = canvasRef.current;
+    if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+
     setStatus("Captured ✓");
     onCapture({ imageDataUrl: snap.toDataURL("image/jpeg", 0.9) });
   }, [onCapture]);
 
-  // ── Minimal mode (lobby inline) ──────────────────────────────────────────
+  // ── Minimal mode ──────────────────────────────────────────────────────────────
   if (minimal) {
     return (
       <div className="flex items-center gap-2">
@@ -131,12 +241,20 @@ export function FaceCapture({
     );
   }
 
-  // ── Full UI (signup) ─────────────────────────────────────────────────────
+  // ── Full UI ───────────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col items-center gap-4">
       {/* Camera frame */}
-      <div className="relative overflow-hidden rounded-2xl border-2 border-neutral-200 bg-black shadow-lg"
-        style={{ width: 320, height: 240 }}>
+      <div
+        className="relative overflow-hidden rounded-2xl border-2 bg-black shadow-lg transition-colors duration-300"
+        style={{
+          width: 320,
+          height: 240,
+          borderColor: faceDetected ? "#22d3ee" : "#e5e7eb",
+          boxShadow: faceDetected ? "0 0 18px rgba(34,211,238,0.35)" : undefined,
+        }}
+      >
+        {/* Mirrored video feed */}
         <video
           ref={videoRef}
           muted
@@ -145,21 +263,13 @@ export function FaceCapture({
           style={{ transform: "scaleX(-1)" }}
         />
 
-        {/* Oval face guide */}
-        {cameraReady && (
-          <svg
-            className="pointer-events-none absolute inset-0 h-full w-full"
-            viewBox="0 0 320 240"
-          >
-            <ellipse
-              cx="160" cy="118" rx="72" ry="90"
-              fill="none"
-              stroke="rgba(255,255,255,0.55)"
-              strokeWidth="2"
-              strokeDasharray="6 4"
-            />
-          </svg>
-        )}
+        {/* face-api.js detection overlay canvas (NOT mirrored — we mirror the box coords in JS) */}
+        <canvas
+          ref={canvasRef}
+          width={640}
+          height={480}
+          className="pointer-events-none absolute inset-0 h-full w-full"
+        />
 
         {/* Loading overlay */}
         {!cameraReady && (
@@ -170,17 +280,26 @@ export function FaceCapture({
         )}
       </div>
 
-      <p className="text-sm text-neutral-500">{status}</p>
+      {/* Status */}
+      <p className={`text-sm transition-colors ${faceDetected ? "text-cyan-500 font-medium" : "text-neutral-500"}`}>
+        {status}
+      </p>
 
-      {/* Capture button (manual mode) */}
+      {/* Capture button */}
       {!matchOnly && (
         <button
           onClick={captureManual}
-          disabled={!cameraReady || status === "Captured ✓"}
+          disabled={!cameraReady || status === "Captured ✓" || (!faceDetected && modelsReady)}
           className="rounded-lg bg-neutral-900 px-6 py-2.5 text-sm font-medium text-white transition hover:bg-neutral-700 disabled:opacity-40"
+          title={!faceDetected && modelsReady ? "No face detected — look directly at the camera" : undefined}
         >
           {status === "Captured ✓" ? "✓ Face saved" : "Capture face"}
         </button>
+      )}
+
+      {/* Hint when face not detected */}
+      {cameraReady && modelsReady && !faceDetected && status !== "Captured ✓" && (
+        <p className="text-xs text-neutral-400">No face detected — look directly at the camera</p>
       )}
     </div>
   );
