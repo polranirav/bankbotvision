@@ -81,6 +81,13 @@ export default function ChatPage() {
   const [selectedRobot, setSelectedRobot] = useState<RobotDef>(ROBOTS[0]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const requestedRobot = params.get("robot")?.toUpperCase();
+    const match = ROBOTS.find((robot) => robot.name === requestedRobot);
+    if (match) setSelectedRobot(match);
+  }, []);
+
   // Fetch Supabase session token
   useEffect(() => {
     const sb = createBrowserClient(

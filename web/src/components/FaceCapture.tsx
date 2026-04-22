@@ -13,9 +13,11 @@ type Props = {
   onError?: (msg: string) => void;
   /** Match-only mode: pass this to identify a face (no capture saved) */
   matchOnly?: boolean;
+  /** Minimal mode keeps camera processing active but hides the large preview UI */
+  minimal?: boolean;
 };
 
-export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
+export function FaceCapture({ onCapture, onError, matchOnly = false, minimal = false }: Props) {
   const faceState = useFaceApi();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -142,10 +144,36 @@ export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
 
   if (faceState === "loading") {
     return (
-      <div className="flex flex-col items-center gap-3 py-6">
+      <div className={`flex flex-col items-center gap-3 ${minimal ? "py-0" : "py-6"}`}>
         <div className="w-8 h-8 border-2 border-neutral-300 border-t-neutral-800 rounded-full animate-spin" />
-        <p className="text-sm text-neutral-500">Loading face recognition models…</p>
-        <p className="text-xs text-neutral-400">(first load only — ~3 seconds)</p>
+        {!minimal && (
+          <>
+            <p className="text-sm text-neutral-500">Loading face recognition models…</p>
+            <p className="text-xs text-neutral-400">(first load only — ~3 seconds)</p>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  if (minimal) {
+    return (
+      <div className="relative">
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          className="absolute h-px w-px opacity-0 pointer-events-none"
+          style={{ transform: "scaleX(-1)" }}
+        />
+        <canvas
+          ref={canvasRef}
+          className="absolute h-px w-px opacity-0 pointer-events-none"
+          style={{ transform: "scaleX(-1)" }}
+        />
+        <div className="rounded-full border border-white/15 bg-slate-950/45 px-4 py-2 text-sm text-white backdrop-blur">
+          {faceDetected ? "Face detected" : status}
+        </div>
       </div>
     );
   }

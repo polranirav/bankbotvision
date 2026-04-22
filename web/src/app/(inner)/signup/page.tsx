@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { api } from "@/lib/api";
@@ -13,10 +13,16 @@ type Step = "creds" | "account" | "face";
 export default function SignupPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("creds");
+  const [agentName, setAgentName] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setAgentName(params.get("agent"));
+  }, []);
 
   // Step 1 — credentials
   async function handleCreds(e: React.FormEvent) {
@@ -87,6 +93,11 @@ export default function SignupPage() {
       {step === "creds" && (
         <>
           <h1 className="text-2xl font-semibold">Create your account</h1>
+          {agentName && (
+            <p className="max-w-xl text-sm text-neutral-500">
+              {agentName} has already welcomed you at the front desk. This is the next step in that account-opening visit.
+            </p>
+          )}
           <form onSubmit={handleCreds} className="space-y-4 max-w-sm">
             <input className="w-full rounded border border-neutral-300 px-3 py-2" type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} required />
             <input className="w-full rounded border border-neutral-300 px-3 py-2" type="password" placeholder="Password (8+ chars)" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} />

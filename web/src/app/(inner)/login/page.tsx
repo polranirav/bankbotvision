@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { FaceCapture, type CaptureResult } from "@/components/FaceCapture";
@@ -10,10 +10,20 @@ type Mode = "choose" | "email" | "face";
 export default function LoginPage() {
   const router = useRouter();
   const [mode, setMode] = useState<Mode>("choose");
+  const [agentName, setAgentName] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const queryMode = params.get("mode");
+    setAgentName(params.get("agent"));
+    if (queryMode === "email" || queryMode === "face") {
+      setMode(queryMode);
+    }
+  }, []);
 
   async function handleEmail(e: React.FormEvent) {
     e.preventDefault();
@@ -54,6 +64,11 @@ export default function LoginPage() {
   return (
     <div className="space-y-6 py-10 max-w-sm">
       <h1 className="text-2xl font-semibold">Log in</h1>
+      {agentName && (
+        <p className="text-sm text-neutral-500">
+          You walked up to {agentName}. Continue with the sign-in option that fits your visit.
+        </p>
+      )}
 
       {mode === "choose" && (
         <div className="flex flex-col gap-3">
