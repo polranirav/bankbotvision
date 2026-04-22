@@ -98,6 +98,12 @@ export default function AccountPage() {
           </p>
         </div>
         <div className="flex gap-2">
+          <button
+            onClick={() => router.push("/chat")}
+            className="rounded bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 text-sm font-medium transition flex items-center gap-1"
+          >
+            🎙️ Voice Chat
+          </button>
           <button onClick={() => setEditing(!editing)} className="rounded border border-neutral-200 px-3 py-1.5 text-sm hover:bg-neutral-50">
             {editing ? "Cancel" : "✏️ Edit"}
           </button>

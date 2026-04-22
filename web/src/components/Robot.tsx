@@ -22,10 +22,11 @@ export const ROBOTS: RobotDef[] = [
 type Props = {
   def: RobotDef;
   position: [number, number, number];
-  onClick: () => void;
+  onClick?: () => void;
+  speaking?: boolean;
 };
 
-export function Robot({ def, position, onClick }: Props) {
+export function Robot({ def, position, onClick, speaking = false }: Props) {
   const groupRef = useRef<THREE.Group>(null);
   const headRef  = useRef<THREE.Group>(null);
   const lArmRef  = useRef<THREE.Group>(null);
@@ -43,17 +44,23 @@ export function Robot({ def, position, onClick }: Props) {
     if (!groupRef.current) return;
     const t = clock.elapsedTime;
 
-    // Idle bob
-    groupRef.current.position.y = position[1] + Math.sin(t * 1.2) * 0.06;
+    // Idle bob — faster + bigger when speaking
+    const bobSpeed = speaking ? 3.5 : 1.2;
+    const bobAmp   = speaking ? 0.10 : 0.06;
+    groupRef.current.position.y = position[1] + Math.sin(t * bobSpeed) * bobAmp;
 
-    // Head gentle sway
+    // Head nod + sway
     if (headRef.current) {
-      headRef.current.rotation.y = Math.sin(t * 0.8) * (hovered ? 0.3 : 0.1);
+      const nodAmp = speaking ? 0.18 : 0;
+      headRef.current.rotation.x = speaking
+        ? Math.sin(t * 4.0) * nodAmp
+        : 0;
+      headRef.current.rotation.y = Math.sin(t * 0.8) * (hovered ? 0.3 : (speaking ? 0.05 : 0.1));
       headRef.current.rotation.z = Math.sin(t * 0.5) * 0.04;
     }
 
-    // Walk cycle (arms + legs swing opposite)
-    const swing = Math.sin(t * 2.0) * 0.35;
+    // Walk cycle (arms + legs swing opposite) — freeze when speaking
+    const swing = speaking ? 0 : Math.sin(t * 2.0) * 0.35;
     if (lArmRef.current) lArmRef.current.rotation.x =  swing;
     if (rArmRef.current) rArmRef.current.rotation.x = -swing;
     if (lLegRef.current) lLegRef.current.rotation.x = -swing * 0.7;
@@ -79,7 +86,7 @@ export function Robot({ def, position, onClick }: Props) {
     <group
       ref={groupRef}
       position={position}
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      onClick={(e) => { e.stopPropagation(); onClick?.(); }}
       onPointerEnter={() => { setHovered(true);  document.body.style.cursor = "pointer"; }}
       onPointerLeave={() => { setHovered(false); document.body.style.cursor = "default"; }}
     >
@@ -102,7 +109,7 @@ export function Robot({ def, position, onClick }: Props) {
         {[-0.16, 0.16].map((x, i) => (
           <mesh key={i} position={[x, 0.05, 0.27]}>
             <sphereGeometry args={[0.08, 16, 16]} />
-            <meshStandardMaterial color={eyeColor} emissive={eyeColor} emissiveIntensity={hovered ? 3 : 1.5} />
+            <meshStandardMaterial color={eyeColor} emissive={eyeColor} emissiveIntensity={hovered ? 3 : speaking ? 2.5 : 1.5} />
           </mesh>
         ))}
         {/* Mouth */}
