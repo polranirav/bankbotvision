@@ -576,7 +576,32 @@ _CQR_PROMPT = (
     "6. If the speech is already clean and clear, return it mostly unchanged.\n"
 )
 
+_LOBBY_CQR_PROMPT = (
+    "You are a speech compression module at a virtual bank lobby kiosk. "
+    "A visitor has just spoken to a robot greeter. Their speech was captured by a "
+    "microphone and may be noisy, accented, fragmented, or full of filler words.\n\n"
+    "Your job: compress what they said into ONE clean, precise sentence that "
+    "captures their true intent.\n\n"
+    "Rules:\n"
+    "1. Remove all filler words (um, uh, like, so, you know, basically, kind of).\n"
+    "2. Fix Whisper transcription errors — e.g. 'checking' often means 'chequing', "
+    "'I want to' fragments mean the visitor wants that service.\n"
+    "3. If they said their name, keep it exactly.\n"
+    "4. Infer the banking intent: check balance / open account / loan / credit card / "
+    "mortgage / documents / speak to advisor / general question.\n"
+    "5. Output ONE sentence only. No preamble, no explanation.\n"
+    "6. If the speech is already clear and short, return it unchanged.\n"
+    "\nExamples:\n"
+    "  Raw: 'uh yeah so I was like wondering if I could maybe um check my you know balance'\n"
+    "  Clean: 'I want to check my account balance.'\n\n"
+    "  Raw: 'so I need to open a new account like a savings one'\n"
+    "  Clean: 'I want to open a new savings account.'\n\n"
+    "  Raw: 'hi my name is Nirav and I just want to know about mortgage rates'\n"
+    "  Clean: 'My name is Nirav and I want to know about mortgage rates.'\n"
+)
 
+
+@traceable(name="Query Compression (CQR)", run_type="llm", tags=["cqr", "banking"])
 def _rewrite_query(
     raw_question: str,
     history: list[ChatTurn],
@@ -598,7 +623,7 @@ def _rewrite_query(
 
     history_text = "\n".join(
         f"{'CUSTOMER' if t.role == 'user' else 'AGENT'}: {t.text}"
-        for t in history[-6:]  # last 6 turns max
+        for t in history[-6:]
     ) or "No prior conversation."
 
     try:
@@ -613,7 +638,6 @@ def _rewrite_query(
             ),
         ])
         rewritten = result.content.strip().strip('"').strip()
-        # Sanity check: rewrite shouldn't be empty or way longer than original
         if rewritten and len(rewritten) < len(raw_question) * 3:
             log.info("   Clean: %r", rewritten)
             return rewritten
@@ -621,6 +645,54 @@ def _rewrite_query(
         log.warning("   CQR failed: %s", e)
 
     return raw_question
+
+
+@traceable(name="Lobby Speech Compression", run_type="llm", tags=["cqr", "lobby"])
+def _compress_utterance(
+    raw_utterance: str,
+    history: list[ChatTurn],
+    llm: ChatOpenAI,
+) -> str:
+    """Lobby-tuned compression: clean up noisy voice input before frontdesk LLM.
+
+    Handles accents, Whisper artifacts, filler words, and fragmented sentences.
+    Returns original if already clean or compression fails.
+    """
+    words = raw_utterance.split()
+    # Skip if already short and clean
+    if len(words) <= 6:
+        return raw_utterance
+
+    log.info("\n🎙️  Lobby CQR: Compressing utterance...")
+    log.info("   Raw: %r", raw_utterance)
+
+    history_text = "\n".join(
+        f"{'VISITOR' if t.role == 'user' else 'ROBOT'}: {t.text}"
+        for t in history[-4:]
+    ) or "First visitor utterance."
+
+    try:
+        result = llm.invoke(
+            [
+                SystemMessage(content=_LOBBY_CQR_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"Recent conversation:\n{history_text}\n\n"
+                        f"Latest visitor speech:\n\"{raw_utterance}\"\n\n"
+                        f"Compressed:"
+                    )
+                ),
+            ],
+            config={"run_name": f"Compress: {raw_utterance[:50]}"},
+        )
+        compressed = result.content.strip().strip('"').strip()
+        if compressed and len(compressed) < len(raw_utterance) * 2:
+            log.info("   Compressed: %r", compressed)
+            return compressed
+    except Exception as e:
+        log.warning("   Lobby CQR failed: %s", e)
+
+    return raw_utterance
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -987,12 +1059,18 @@ def agent_query(
     tags=["frontdesk", "lobby"],
 )
 def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
-    """LLM decision — wrapped so LangSmith records the full utterance → reply turn."""
+    """Compress raw speech → clean intent → structured routing decision."""
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0.2,
         api_key=settings.openai_api_key,
     )
+
+    # Step 1: compress messy voice input into clean intent
+    clean_utterance = _compress_utterance(payload.utterance, payload.history, llm)
+    if clean_utterance != payload.utterance:
+        log.info("   🗜️  Compressed: %r → %r", payload.utterance[:60], clean_utterance[:60])
+
     structured_llm = llm.with_structured_output(FrontDeskResponse)
 
     history_lines = "\n".join(
@@ -1010,6 +1088,7 @@ def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
         f"Magic link ready: {payload.has_magic_link}."
     )
 
+    # Step 2: routing decision using compressed utterance
     decision = structured_llm.invoke(
         [
             SystemMessage(content=_frontdesk_system_prompt(payload.robot_name)),
@@ -1017,17 +1096,18 @@ def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
                 content=(
                     f"Session context:\n{session_context}\n\n"
                     f"Recent conversation:\n{history_lines}\n\n"
-                    f"Latest visitor utterance:\n{payload.utterance}"
+                    f"Visitor said (compressed from raw speech):\n{clean_utterance}"
                 )
             ),
         ],
         config={
-            "run_name": f"[{payload.robot_name}] {payload.utterance[:60]}",
+            "run_name": f"[{payload.robot_name}] {clean_utterance[:60]}",
             "metadata": {
                 "robot": payload.robot_name,
                 "visitor": payload.recognised_name or "guest",
                 "face_match": payload.has_face_match,
-                "utterance": payload.utterance,
+                "raw_utterance": payload.utterance,
+                "compressed_utterance": clean_utterance,
             },
         },
     )
