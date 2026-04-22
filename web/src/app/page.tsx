@@ -62,6 +62,10 @@ export default function Home() {
   const speechTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const listenRetryRef = useRef(0);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const vadAudioCtxRef = useRef<AudioContext | null>(null);
+  const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const autoListenEnabledRef = useRef(false);
+  const [vadLevel, setVadLevel] = useState(0); // 0–100, for waveform indicator
 
   const [authFirstName, setAuthFirstName] = useState<string | null>(null);
   const [selectedRobot, setSelectedRobot] = useState<RobotDef | null>(null);
@@ -150,10 +154,11 @@ export default function Home() {
   function finishAgentAction(action?: AgentAction) {
     if (!action) return;
 
-    if (action.autoListen && micGranted && speechSupported) {
+    if (action.autoListen) {
+      // Always auto-listen after robot speaks — VAD handles stop automatically
       speechTimeoutRef.current = setTimeout(() => {
-        startListening();
-      }, 450);
+        void startVADListen();
+      }, 500);
       return;
     }
 
@@ -238,13 +243,15 @@ export default function Home() {
     setSessionError("");
     setLobbyStatus(`${robot.name} is greeting you at Desk ${index + 1}.`);
 
+    autoListenEnabledRef.current = true;
+
     // Speak FIRST — must happen synchronously within the click gesture.
-    // Any await before this breaks Chrome's user-gesture chain for Web Speech API.
     speakAgent(
       `Hello! Welcome to BankBot Vision. I'm ${robot.name}. Let me scan your face, then tell me how I can help you today.`,
+      { autoListen: true },
     );
 
-    // Request mic after — this await is safe because speech is already unlocked above.
+    // Request mic after — safe because speech already unlocked above.
     await requestMicrophone();
   }
 
@@ -258,9 +265,8 @@ export default function Home() {
   }
 
   function closeSession() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
-    }
+    autoListenEnabledRef.current = false;
+    stopVAD();
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
@@ -439,101 +445,85 @@ export default function Home() {
     }
   }
 
-  async function startListening() {
-    if (typeof window === "undefined" || !("MediaRecorder" in window)) {
-      setSpeechSupported(false);
-      setSessionError("Voice recording is limited in this browser.");
-      speakAgent("Hello, how can I help you today?", { autoListen: false });
-      return;
-    }
-
-    if (!micGranted) {
-      const granted = await requestMicrophone();
-      if (!granted) {
-        speakAgent(
-          "Please allow microphone access, then I can hear you properly. Hello, how can I help you today?",
-          { autoListen: false },
-        );
-        return;
-      }
-    }
-
+  // ── VAD auto-listen — no button required ─────────────────────────────────
+  function stopVAD() {
+    if (vadIntervalRef.current) { clearInterval(vadIntervalRef.current); vadIntervalRef.current = null; }
+    if (vadAudioCtxRef.current) { vadAudioCtxRef.current.close().catch(() => {}); vadAudioCtxRef.current = null; }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      return;
+      mediaRecorderRef.current.stop();
     }
+    setVadLevel(0);
+  }
+
+  async function startVADListen() {
+    if (!autoListenEnabledRef.current) return;
+    if (mediaRecorderRef.current?.state === "recording") return;
+    if (typeof window === "undefined" || !("MediaRecorder" in window)) return;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!autoListenEnabledRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
+
+      // Web Audio for VAD
+      const audioCtx = new AudioContext();
+      vadAudioCtxRef.current = audioCtx;
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      audioCtx.createMediaStreamSource(stream).connect(analyser);
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      // Calibrate ambient noise over 400 ms
+      await new Promise(r => setTimeout(r, 400));
+      if (!autoListenEnabledRef.current) { stream.getTracks().forEach(t => t.stop()); audioCtx.close(); return; }
+      analyser.getByteFrequencyData(dataArray);
+      const ambient = dataArray.slice(0, 32).reduce((a, b) => a + b, 0) / 32;
+      const SPEECH_THRESH = Math.max(14, ambient * 2.8);
+
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
+        ? "audio/webm;codecs=opus" : "audio/webm";
       const recorder = new MediaRecorder(stream, { mimeType });
-
       audioChunksRef.current = [];
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) audioChunksRef.current.push(event.data);
-      };
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+
+      let hasSpeech = false;
+      let silenceStart = Date.now();
+      const recordStart = Date.now();
+
       recorder.onstop = async () => {
-        recorder.stream.getTracks().forEach((track) => track.stop());
-
-        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType });
+        stream.getTracks().forEach(t => t.stop());
+        if (vadAudioCtxRef.current === audioCtx) { audioCtx.close(); vadAudioCtxRef.current = null; }
         mediaRecorderRef.current = null;
+        setVadLevel(0);
 
-        if (blob.size < 500) {
-          setSessionStage("ready");
-          setSessionError("I couldn't hear that clearly. Please try again.");
-          if (listenRetryRef.current < 1) {
-            listenRetryRef.current += 1;
-            speakAgent("Hello, I didn't catch that clearly. How can I help you today?", {
-              autoListen: micGranted && speechSupported,
-            });
-          }
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        // Too short or no real speech — restart listener
+        if (!hasSpeech || blob.size < 800) {
+          if (autoListenEnabledRef.current) setTimeout(() => startVADListen(), 400);
           return;
         }
 
         setSessionStage("processing");
         setSessionError("");
-
         try {
           const form = new FormData();
           form.append("file", blob, "audio.webm");
-          const res = await fetch(`${API_URL}/voice/transcribe`, {
-            method: "POST",
-            body: form,
-          });
-
-          if (!res.ok) {
-            throw new Error("I couldn't transcribe that clearly.");
-          }
-
+          const res = await fetch(`${API_URL}/voice/transcribe`, { method: "POST", body: form });
+          if (!res.ok) throw new Error("Transcription failed");
           const { text } = await res.json();
           const transcript = text?.trim();
-
-          if (!transcript) {
-            throw new Error("I couldn't transcribe that clearly.");
-          }
+          if (!transcript) throw new Error("Empty transcript");
 
           listenRetryRef.current = 0;
-          const nextHistory = [
+          const next = [
             ...messagesRef.current,
-            {
-              id: `visitor-${Date.now()}-${messagesRef.current.length}`,
-              role: "visitor" as const,
-              text: transcript,
-            },
+            { id: `v-${Date.now()}`, role: "visitor" as const, text: transcript },
           ];
-          messagesRef.current = nextHistory;
-          setMessages(nextHistory);
+          messagesRef.current = next;
+          setMessages(next);
           await processVisitorRequest(transcript);
-        } catch (error) {
+        } catch {
           setSessionStage("ready");
-          setSessionError(error instanceof Error ? error.message : "I couldn't transcribe that clearly.");
-          if (listenRetryRef.current < 1) {
-            listenRetryRef.current += 1;
-            speakAgent("Hello, I didn't catch that clearly. How can I help you today?", {
-              autoListen: micGranted && speechSupported,
-            });
-          }
+          if (autoListenEnabledRef.current) setTimeout(() => startVADListen(), 800);
         }
       };
 
@@ -541,19 +531,38 @@ export default function Home() {
       setSessionStage("listening");
       setSessionError("");
       recorder.start(100);
-    } catch (error) {
-      setSessionStage("ready");
-      setSessionError(error instanceof Error ? error.message : "Unable to start voice recording.");
-      speakAgent("Hello, I couldn't start the microphone properly. How can I help you today?", {
-        autoListen: false,
-      });
-    }
-  }
 
-  function stopListening() {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state !== "recording") return;
-    recorder.stop();
+      // VAD loop — check level every 80 ms
+      vadIntervalRef.current = setInterval(() => {
+        analyser.getByteFrequencyData(dataArray);
+        const level = Math.round(
+          (dataArray.slice(0, 48).reduce((a, b) => a + b, 0) / 48 / 255) * 100
+        );
+        setVadLevel(level);
+
+        const speaking = level * 2.55 > SPEECH_THRESH;
+        if (speaking) {
+          hasSpeech = true;
+          silenceStart = Date.now();
+        }
+
+        const silenceDuration = Date.now() - silenceStart;
+        const elapsed = Date.now() - recordStart;
+
+        // Stop conditions: silence after speech (1.4s) OR no speech in 9s
+        if (hasSpeech && silenceDuration > 1400) {
+          if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
+          if (recorder.state === "recording") recorder.stop();
+        } else if (!hasSpeech && elapsed > 9000) {
+          if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
+          if (recorder.state === "recording") recorder.stop();
+        }
+      }, 80);
+
+    } catch {
+      setSessionStage("ready");
+      if (autoListenEnabledRef.current) setTimeout(() => startVADListen(), 1500);
+    }
   }
 
   const sessionTitle = useMemo(() => {
@@ -687,100 +696,96 @@ export default function Home() {
 
         {sessionOpen && selectedRobot && (
           <>
-            <div className="pointer-events-none absolute inset-0 z-30 bg-[radial-gradient(circle_at_center,transparent_0%,transparent_42%,rgba(2,6,23,0.18)_100%)]" />
+            {/* Invisible face scanner */}
+            {(cameraState === "waiting" || cameraState === "matching") && (
+              <div className="pointer-events-none absolute opacity-0">
+                <FaceCapture
+                  onCapture={handleFaceCapture}
+                  onError={handleFaceError}
+                  matchOnly
+                  minimal
+                />
+              </div>
+            )}
 
-            <div className="absolute right-4 top-[96px] z-40 flex max-w-[340px] flex-col gap-3 sm:right-6">
-              <div className="rounded-[26px] border border-white/10 bg-slate-950/46 px-4 py-4 text-white shadow-[0_20px_80px_rgba(2,6,23,0.38)] backdrop-blur-xl">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-[11px] uppercase tracking-[0.32em] text-sky-200/75">Desk Session</p>
-                    <p className="mt-2 text-lg font-semibold">{sessionTitle}</p>
-                  </div>
-                  <button
-                    onClick={closeSession}
-                    className="rounded-full border border-white/15 px-3 py-1.5 text-xs font-medium text-white/85 transition hover:bg-white/10"
-                  >
-                    Leave
-                  </button>
-                </div>
-
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <div className="rounded-full bg-white/10 px-3 py-2 text-sm">
-                    {selectedRobot.name}
-                  </div>
-                  <div className="rounded-full bg-white/10 px-3 py-2 text-sm">
-                    {cameraState === "matched"
-                      ? "Recognised"
-                      : cameraState === "new"
-                        ? "First visit"
-                        : cameraState === "matching"
-                          ? "Scanning"
-                          : cameraState === "error"
-                            ? "Scan issue"
-                            : "Checking face"}
-                  </div>
-                  <div className="rounded-full bg-white/10 px-3 py-2 text-sm">
-                    {sessionStage === "listening"
-                      ? "Listening"
-                      : sessionStage === "processing"
-                        ? "Responding"
-                        : "Ready"}
-                  </div>
-                  {recognisedName && (
-                    <div className="rounded-full bg-emerald-400/15 px-3 py-2 text-sm text-emerald-100">
-                      {recognisedName}
-                    </div>
-                  )}
-                </div>
-
-                {(cameraState === "waiting" || cameraState === "matching") && (
-                  <div className="mt-4">
-                    <FaceCapture
-                      onCapture={handleFaceCapture}
-                      onError={handleFaceError}
-                      matchOnly
-                      minimal
-                    />
-                  </div>
-                )}
-
-                {sessionError && (
-                  <div className="mt-4 rounded-2xl border border-amber-200/20 bg-amber-400/10 px-3 py-3 text-sm text-amber-100">
-                    {sessionError}
-                  </div>
+            {/* Top-left: robot identity chip */}
+            <div className="absolute left-4 top-[80px] z-40 flex items-center gap-2 sm:left-6">
+              <div
+                className="flex items-center gap-2 rounded-full border border-white/15 bg-slate-950/55 px-3 py-1.5 text-white backdrop-blur-xl"
+                style={{ borderColor: `${selectedRobot.color}40` }}
+              >
+                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: selectedRobot.color }} />
+                <span className="text-xs font-semibold tracking-wide">{selectedRobot.name}</span>
+                {recognisedName && (
+                  <span className="text-xs text-emerald-300">· {recognisedName}</span>
                 )}
               </div>
+              <button
+                onClick={closeSession}
+                className="rounded-full border border-white/15 bg-slate-950/55 px-3 py-1.5 text-xs text-white/70 backdrop-blur-xl transition hover:bg-white/10"
+              >
+                Leave
+              </button>
             </div>
 
-            <div className="absolute inset-x-0 bottom-6 z-40 flex justify-center px-4">
-              <div className="flex flex-wrap items-center justify-center gap-3 rounded-full border border-white/10 bg-slate-950/52 px-4 py-3 text-white shadow-[0_20px_80px_rgba(2,6,23,0.34)] backdrop-blur-xl">
-                <button
-                  onClick={sessionStage === "listening" ? stopListening : () => { void startListening(); }}
-                  disabled={!speechSupported || sessionStage === "processing"}
-                  className="rounded-full bg-white/10 px-5 py-2.5 text-sm font-semibold transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {sessionStage === "listening"
-                    ? "Stop recording"
-                    : sessionStage === "processing"
-                      ? "Processing..."
-                      : "Talk to agent"}
-                </button>
+            {/* Bottom overlay: transcript + listening indicator */}
+            <div className="absolute inset-x-0 bottom-0 z-40 flex flex-col items-center gap-3 pb-8 pt-4">
 
-                {!micGranted && (
-                  <button
-                    onClick={() => { void requestMicrophone(); }}
-                    className="rounded-full border border-white/15 px-5 py-2.5 text-sm font-medium transition hover:bg-white/10"
-                  >
-                    Allow microphone
-                  </button>
-                )}
+              {/* Last few messages */}
+              {messages.length > 0 && (
+                <div className="w-full max-w-lg space-y-1.5 px-4">
+                  {messages.slice(-3).map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={[
+                        "rounded-2xl px-4 py-2 text-sm leading-relaxed backdrop-blur-xl",
+                        msg.role === "agent"
+                          ? "ml-4 border border-white/10 bg-slate-950/55 text-white/90"
+                          : "mr-4 border border-sky-400/20 bg-sky-950/50 text-sky-100",
+                      ].join(" ")}
+                    >
+                      {msg.text}
+                    </div>
+                  ))}
+                </div>
+              )}
 
-                {!speechSupported && (
-                  <div className="rounded-full border border-white/15 px-4 py-2.5 text-sm text-white/80">
-                    Voice recording is limited in this browser.
-                  </div>
+              {/* VAD indicator */}
+              <div className="flex items-center gap-3 rounded-full border border-white/10 bg-slate-950/60 px-5 py-2.5 backdrop-blur-xl">
+                {sessionStage === "listening" ? (
+                  <>
+                    {/* Live audio bars */}
+                    <div className="flex items-end gap-[3px]" style={{ height: 18 }}>
+                      {[0.4, 0.7, 1, 0.6, 0.85, 0.5, 0.9].map((base, i) => (
+                        <div
+                          key={i}
+                          className="w-[3px] rounded-full bg-sky-400 transition-all duration-75"
+                          style={{
+                            height: `${Math.max(3, Math.min(18, (vadLevel * base * 0.18) + 3))}px`,
+                            opacity: 0.6 + base * 0.4,
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <span className="text-xs font-medium text-sky-300">Listening…</span>
+                  </>
+                ) : sessionStage === "processing" ? (
+                  <>
+                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white/80" />
+                    <span className="text-xs font-medium text-white/70">Thinking…</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-white/30" />
+                    <span className="text-xs text-white/40">
+                      {cameraState === "waiting" || cameraState === "matching"
+                        ? "Scanning face…"
+                        : "Ready"}
+                    </span>
+                  </>
                 )}
               </div>
+
             </div>
           </>
         )}

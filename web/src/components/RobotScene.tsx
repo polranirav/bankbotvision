@@ -39,16 +39,18 @@ function CameraRig({ focusIndex }: CameraProps) {
 
   useFrame(() => {
     if (focusIndex !== null) {
+      // Zoom right up to face — robot fills the screen
       const dx = DESK_POSITIONS[focusIndex][0];
-      targetPos.current.set(dx * 0.82, 0.92, 2.7);
-      targetLook.current.set(dx, 0.44, -0.12);
+      targetPos.current.set(dx * 0.78, 0.88, 1.35);
+      targetLook.current.set(dx, 0.72, -0.1);
     } else {
       targetPos.current.set(0, 1.8, 9);
       targetLook.current.set(0, 0.25, 0);
     }
 
-    camera.position.lerp(targetPos.current, focusIndex !== null ? 0.08 : 0.05);
-    currentLook.current.lerp(targetLook.current, focusIndex !== null ? 0.1 : 0.06);
+    const speed = focusIndex !== null ? 0.055 : 0.045;
+    camera.position.lerp(targetPos.current, speed);
+    currentLook.current.lerp(targetLook.current, speed + 0.02);
     camera.lookAt(currentLook.current);
   });
 
