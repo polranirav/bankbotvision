@@ -454,16 +454,11 @@ export default function Home() {
       }
 
       const action: AgentAction = {};
-      if (decision.should_route) {
-        if (decision.route_target === "signup") {
-          action.routePush = `/signup?agent=${encodedAgent}`;
-        } else if (decision.route_target === "login") {
-          action.routePush = `/login?agent=${encodedAgent}&mode=choose`;
-        } else if (decision.route_target === "magic_link" && pendingMagicLink) {
-          action.magicLink = pendingMagicLink;
-        } else {
-          action.autoListen = micGranted && speechSupported;
-        }
+      // TODO: signup/login routing is disabled until auth flow is built separately.
+      // For now, magic_link is the only routing that fires — everything else
+      // keeps the conversation going in the lobby.
+      if (decision.should_route && decision.route_target === "magic_link" && pendingMagicLink) {
+        action.magicLink = pendingMagicLink;
       } else {
         action.autoListen = micGranted && speechSupported;
       }
