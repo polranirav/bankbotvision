@@ -39,9 +39,9 @@ function CameraRig({ focusIndex }: CameraProps) {
 
   useFrame(() => {
     if (focusIndex !== null) {
-      // Zoom right up to face — robot fills the screen
+      // Zoom to desk — robot is prominent but not overwhelming
       const dx = DESK_POSITIONS[focusIndex][0];
-      targetPos.current.set(dx * 0.78, 0.88, 1.35);
+      targetPos.current.set(dx * 0.82, 1.0, 2.3);
       targetLook.current.set(dx, 0.72, -0.1);
     } else {
       targetPos.current.set(0, 1.8, 9);
@@ -136,9 +136,10 @@ type SceneProps = {
   onSelectRobot: (robot: RobotDef, index: number) => void;
   focusIndex: number | null;
   speakingIndex: number | null;
+  listeningIndex: number | null;
 };
 
-function SceneContent({ onSelectRobot, focusIndex, speakingIndex }: SceneProps) {
+function SceneContent({ onSelectRobot, focusIndex, speakingIndex, listeningIndex }: SceneProps) {
   return (
     <>
       <ambientLight intensity={0.25} />
@@ -164,6 +165,7 @@ function SceneContent({ onSelectRobot, focusIndex, speakingIndex }: SceneProps) 
             position={ROBOT_OFFSETS[i]}
             onClick={() => onSelectRobot(robot, i)}
             speaking={speakingIndex === i}
+            listening={listeningIndex === i}
             seated
             active={focusIndex === i}
             activity={DESK_ACTIVITIES[i]}
@@ -181,9 +183,10 @@ type Props = {
   onSelectRobot: (robot: RobotDef, index: number) => void;
   focusIndex: number | null;
   speakingIndex: number | null;
+  listeningIndex: number | null;
 };
 
-export function RobotScene({ onSelectRobot, focusIndex, speakingIndex }: Props) {
+export function RobotScene({ onSelectRobot, focusIndex, speakingIndex, listeningIndex }: Props) {
   return (
     <Canvas
       camera={{ position: [0, 1.8, 9], fov: 52 }}
@@ -195,6 +198,7 @@ export function RobotScene({ onSelectRobot, focusIndex, speakingIndex }: Props) 
           onSelectRobot={onSelectRobot}
           focusIndex={focusIndex}
           speakingIndex={speakingIndex}
+          listeningIndex={listeningIndex}
         />
       </Suspense>
     </Canvas>

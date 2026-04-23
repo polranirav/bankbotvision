@@ -5,6 +5,94 @@ import { useFrame } from "@react-three/fiber";
 import { RoundedBox } from "@react-three/drei";
 import * as THREE from "three";
 
+// ── Chest spark effect — orbiting particles + inner glow ─────────────────────
+function ChestEffect({
+  listening,
+  speaking,
+  eyeColor,
+  torsoY,
+}: {
+  listening: boolean;
+  speaking: boolean;
+  eyeColor: THREE.Color;
+  torsoY: number;
+}) {
+  const glowRef = useRef<THREE.Mesh>(null);
+  const s0 = useRef<THREE.Mesh>(null);
+  const s1 = useRef<THREE.Mesh>(null);
+  const s2 = useRef<THREE.Mesh>(null);
+  const s3 = useRef<THREE.Mesh>(null);
+  const s4 = useRef<THREE.Mesh>(null);
+  const s5 = useRef<THREE.Mesh>(null);
+  const sparks = [s0, s1, s2, s3, s4, s5];
+  const N = sparks.length;
+
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+
+    if (glowRef.current) {
+      const mat = glowRef.current.material as THREE.MeshStandardMaterial;
+      if (speaking) {
+        mat.emissiveIntensity = 1.2 + Math.abs(Math.sin(t * 11)) * 2.8;
+        mat.opacity = 0.55 + Math.abs(Math.sin(t * 9)) * 0.3;
+      } else if (listening) {
+        mat.emissiveIntensity = 0.7 + Math.abs(Math.sin(t * 5)) * 1.4;
+        mat.opacity = 0.35 + Math.abs(Math.sin(t * 4)) * 0.2;
+      } else {
+        mat.emissiveIntensity = 0.15 + Math.abs(Math.sin(t * 1.4)) * 0.2;
+        mat.opacity = 0.18;
+      }
+    }
+
+    sparks.forEach((ref, i) => {
+      if (!ref.current) return;
+      const speed = speaking ? 4.5 : listening ? 2.8 : 0.7;
+      const radius = speaking ? 0.16 : listening ? 0.13 : 0.08;
+      const angle = t * speed + (i / N) * Math.PI * 2;
+      ref.current.position.x = Math.cos(angle) * radius;
+      ref.current.position.y = Math.sin(angle * 0.65 + i * 0.9) * (radius * 0.6);
+      const mat = ref.current.material as THREE.MeshStandardMaterial;
+      mat.emissiveIntensity = speaking
+        ? 2.5 + Math.sin(t * 9 + i * 1.3) * 2
+        : listening
+          ? 1.2 + Math.sin(t * 5 + i * 1.1) * 1
+          : 0.15 + Math.sin(t * 1.2 + i) * 0.1;
+      mat.opacity = speaking ? 0.9 : listening ? 0.75 : 0.25;
+    });
+  });
+
+  return (
+    <group position={[0, torsoY + 0.05, 0.26]}>
+      {/* Inner glow plane */}
+      <mesh ref={glowRef}>
+        <planeGeometry args={[0.36, 0.3]} />
+        <meshStandardMaterial
+          color={eyeColor}
+          emissive={eyeColor}
+          emissiveIntensity={0.15}
+          transparent
+          opacity={0.18}
+          depthWrite={false}
+        />
+      </mesh>
+      {/* Orbiting spark particles */}
+      {sparks.map((ref, i) => (
+        <mesh key={i} ref={ref} position={[0, 0, 0.01]}>
+          <sphereGeometry args={[listening || speaking ? 0.022 : 0.014, 6, 6]} />
+          <meshStandardMaterial
+            color={eyeColor}
+            emissive={eyeColor}
+            emissiveIntensity={0.5}
+            transparent
+            opacity={0.3}
+            depthWrite={false}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
 export type RobotDef = {
   name: string;
   color: string;
@@ -46,8 +134,9 @@ type Props = {
   position: [number, number, number];
   onClick?: () => void;
   speaking?: boolean;
-  seated?: boolean;     // seated at desk pose
-  active?: boolean;     // this desk is currently selected/focused
+  listening?: boolean;  // VAD is recording — show listening effect
+  seated?: boolean;
+  active?: boolean;
   activity?: "typing" | "busy" | "waiting";
 };
 
@@ -56,6 +145,7 @@ export function Robot({
   position,
   onClick,
   speaking = false,
+  listening = false,
   seated = false,
   active = false,
   activity = "waiting",
@@ -79,9 +169,9 @@ export function Robot({
     const activityIsTyping = seated && activity === "typing" && !active && !speaking;
     const activityIsBusy = seated && activity === "busy" && !active && !speaking;
 
-    // Bob — gentle when seated, lively when speaking
-    const bobSpeed = speaking ? 3.5 : active ? 1.9 : activityIsBusy ? 1.8 : 1.2;
-    const bobAmp   = speaking ? 0.06 : active ? 0.038 : (seated ? 0.025 : 0.06);
+    // Bob — gentle when idle, lively when speaking, slow heartbeat when listening
+    const bobSpeed = speaking ? 3.5 : listening ? 2.2 : active ? 1.9 : activityIsBusy ? 1.8 : 1.2;
+    const bobAmp   = speaking ? 0.06 : listening ? 0.03 : active ? 0.038 : (seated ? 0.025 : 0.06);
     groupRef.current.position.y = position[1] + Math.sin(t * bobSpeed) * bobAmp;
 
     // Head nod + sway
@@ -168,10 +258,17 @@ export function Robot({
         {mat((hovered || active) ? lightColor : bodyColor)}
       </RoundedBox>
 
-      {/* Chest panel */}
+      {/* Chest panel backing */}
       <RoundedBox args={[0.4, 0.35, 0.05]} radius={0.04} position={[0, torsoY + 0.05, 0.23]}>
         <meshStandardMaterial color={darkColor} roughness={0.2} metalness={0.8} />
       </RoundedBox>
+      {/* Chest spark effect — orbiting glow particles */}
+      <ChestEffect
+        listening={listening}
+        speaking={speaking}
+        eyeColor={eyeColor}
+        torsoY={torsoY}
+      />
 
       {/* Head */}
       <group ref={headRef} position={[0, headY, 0]}>

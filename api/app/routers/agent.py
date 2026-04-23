@@ -660,8 +660,8 @@ def _compress_utterance(
     Returns original if already clean or compression fails.
     """
     words = raw_utterance.split()
-    # Skip if already short and clean
-    if len(words) <= 6:
+    # Skip compression for short utterances — most lobby speech is under 15 words
+    if len(words) <= 14:
         return raw_utterance
 
     log.info("\n🎙️  Lobby CQR: Compressing utterance...")

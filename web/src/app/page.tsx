@@ -76,6 +76,7 @@ export default function Home() {
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
   const [sessionStage, setSessionStage] = useState<SessionStage>("idle");
+  const [isRobotSpeaking, setIsRobotSpeaking] = useState(false);
   const [cameraState, setCameraState] = useState<CameraState>("waiting");
   const [micGranted, setMicGranted] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(true);
@@ -195,6 +196,7 @@ export default function Home() {
     // will see a stale generation and bail out immediately.
     const gen = ++speechGenRef.current;
     isSpeakingRef.current = true;
+    setIsRobotSpeaking(true);
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1;
@@ -207,6 +209,7 @@ export default function Home() {
       // Stale if a newer speakAgent call has started
       if (speechGenRef.current !== gen) return;
       isSpeakingRef.current = false;
+      setIsRobotSpeaking(false);
       if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
       finishAgentAction(action);
     };
@@ -263,9 +266,10 @@ export default function Home() {
 
     autoListenEnabledRef.current = true;
 
-    // Speak FIRST — must happen synchronously within the click gesture.
+    // Speak FIRST — must happen synchronously within the click gesture to unlock
+    // the Web Speech API. Face scan will interrupt this with the real greeting.
     speakAgent(
-      `Hi, welcome! I'm ${robot.name}. Just give me a moment to see if I recognise you.`,
+      `Hi, one moment.`,
       { autoListen: true },
     );
 
@@ -584,8 +588,8 @@ export default function Home() {
         const silenceDuration = Date.now() - silenceStart;
         const elapsed = Date.now() - recordStart;
 
-        // Stop conditions: silence after speech (1.4s) OR no speech in 9s
-        if (hasSpeech && silenceDuration > 1400) {
+        // Stop conditions: silence after speech (900ms) OR no speech in 9s
+        if (hasSpeech && silenceDuration > 900) {
           if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
           if (recorder.state === "recording") recorder.stop();
         } else if (!hasSpeech && elapsed > 9000) {
@@ -678,9 +682,8 @@ export default function Home() {
           <RobotScene
             onSelectRobot={handleSelectRobot}
             focusIndex={focusIndex}
-            speakingIndex={
-              sessionStage === "listening" || sessionStage === "processing" ? focusIndex : null
-            }
+            speakingIndex={isRobotSpeaking ? focusIndex : null}
+            listeningIndex={sessionStage === "listening" ? focusIndex : null}
           />
         </div>
 
@@ -743,85 +746,70 @@ export default function Home() {
               </div>
             )}
 
-            {/* Top-left: robot identity chip */}
+            {/* Ambient screen-edge glow — pulses when listening, steady when speaking */}
+            <div
+              className="pointer-events-none absolute inset-0 z-10 transition-opacity duration-500"
+              style={{
+                opacity: sessionStage === "listening" ? 1 : isRobotSpeaking ? 0.6 : 0,
+                boxShadow: `inset 0 0 80px 12px ${selectedRobot.color}28`,
+              }}
+            />
+
+            {/* Top-left: robot identity chip + leave */}
             <div className="absolute left-4 top-[80px] z-40 flex items-center gap-2 sm:left-6">
               <div
-                className="flex items-center gap-2 rounded-full border border-white/15 bg-slate-950/55 px-3 py-1.5 text-white backdrop-blur-xl"
-                style={{ borderColor: `${selectedRobot.color}40` }}
+                className="flex items-center gap-2 rounded-full border bg-slate-950/60 px-3 py-1.5 text-white backdrop-blur-xl"
+                style={{ borderColor: `${selectedRobot.color}50` }}
               >
-                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: selectedRobot.color }} />
+                <span
+                  className="h-1.5 w-1.5 rounded-full"
+                  style={{
+                    backgroundColor: selectedRobot.color,
+                    boxShadow: sessionStage === "listening"
+                      ? `0 0 6px 2px ${selectedRobot.color}`
+                      : "none",
+                  }}
+                />
                 <span className="text-xs font-semibold tracking-wide">{selectedRobot.name}</span>
                 {recognisedName && (
-                  <span className="text-xs text-emerald-300">· {recognisedName}</span>
+                  <span className="text-xs text-emerald-300/80">· {recognisedName}</span>
                 )}
               </div>
               <button
                 onClick={closeSession}
-                className="rounded-full border border-white/15 bg-slate-950/55 px-3 py-1.5 text-xs text-white/70 backdrop-blur-xl transition hover:bg-white/10"
+                className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1.5 text-xs text-white/50 backdrop-blur-xl transition hover:bg-white/10 hover:text-white/80"
               >
                 Leave
               </button>
             </div>
 
-            {/* Bottom overlay: transcript + listening indicator */}
-            <div className="absolute inset-x-0 bottom-0 z-40 flex flex-col items-center gap-3 pb-8 pt-4">
-
-              {/* Last few messages */}
-              {messages.length > 0 && (
-                <div className="w-full max-w-lg space-y-1.5 px-4">
-                  {messages.slice(-3).map((msg) => (
-                    <div
-                      key={msg.id}
-                      className={[
-                        "rounded-2xl px-4 py-2 text-sm leading-relaxed backdrop-blur-xl",
-                        msg.role === "agent"
-                          ? "ml-4 border border-white/10 bg-slate-950/55 text-white/90"
-                          : "mr-4 border border-sky-400/20 bg-sky-950/50 text-sky-100",
-                      ].join(" ")}
-                    >
-                      {msg.text}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* VAD indicator */}
-              <div className="flex items-center gap-3 rounded-full border border-white/10 bg-slate-950/60 px-5 py-2.5 backdrop-blur-xl">
-                {sessionStage === "listening" ? (
-                  <>
-                    {/* Live audio bars */}
-                    <div className="flex items-end gap-[3px]" style={{ height: 18 }}>
-                      {[0.4, 0.7, 1, 0.6, 0.85, 0.5, 0.9].map((base, i) => (
+            {/* Bottom: minimal status dot — only visible while actively listening or thinking */}
+            {(sessionStage === "listening" || sessionStage === "processing") && (
+              <div className="absolute inset-x-0 bottom-8 z-40 flex justify-center">
+                <div className="flex items-center gap-2 rounded-full border border-white/8 bg-slate-950/50 px-4 py-2 backdrop-blur-xl">
+                  {sessionStage === "listening" ? (
+                    /* Animated waveform bars — compact */
+                    <div className="flex items-end gap-[2px]" style={{ height: 14 }}>
+                      {[0.4, 0.75, 1, 0.6, 0.9, 0.5, 0.8].map((base, i) => (
                         <div
                           key={i}
-                          className="w-[3px] rounded-full bg-sky-400 transition-all duration-75"
+                          className="w-[2px] rounded-full transition-all duration-75"
                           style={{
-                            height: `${Math.max(3, Math.min(18, (vadLevel * base * 0.18) + 3))}px`,
-                            opacity: 0.6 + base * 0.4,
+                            height: `${Math.max(2, Math.min(14, (vadLevel * base * 0.14) + 2))}px`,
+                            backgroundColor: selectedRobot.color,
+                            opacity: 0.55 + base * 0.45,
                           }}
                         />
                       ))}
                     </div>
-                    <span className="text-xs font-medium text-sky-300">Listening…</span>
-                  </>
-                ) : sessionStage === "processing" ? (
-                  <>
-                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white/80" />
-                    <span className="text-xs font-medium text-white/70">Thinking…</span>
-                  </>
-                ) : (
-                  <>
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-white/30" />
-                    <span className="text-xs text-white/40">
-                      {cameraState === "waiting" || cameraState === "matching"
-                        ? "Scanning face…"
-                        : "Ready"}
-                    </span>
-                  </>
-                )}
+                  ) : (
+                    <span
+                      className="h-2 w-2 animate-spin rounded-full border border-white/20 border-t-white/60"
+                    />
+                  )}
+                </div>
               </div>
-
-            </div>
+            )}
           </>
         )}
       </main>
