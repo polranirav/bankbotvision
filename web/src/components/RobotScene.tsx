@@ -39,10 +39,10 @@ function CameraRig({ focusIndex }: CameraProps) {
 
   useFrame(() => {
     if (focusIndex !== null) {
-      // Zoom to desk — robot is prominent but not overwhelming
+      // Centered, intentional — robot at ~70% visual scale with clear space
       const dx = DESK_POSITIONS[focusIndex][0];
-      targetPos.current.set(dx * 0.82, 1.0, 2.3);
-      targetLook.current.set(dx, 0.72, -0.1);
+      targetPos.current.set(dx * 0.84, 1.05, 3.0);
+      targetLook.current.set(dx, 0.68, -0.1);
     } else {
       targetPos.current.set(0, 1.8, 9);
       targetLook.current.set(0, 0.25, 0);
@@ -189,7 +189,7 @@ type Props = {
 export function RobotScene({ onSelectRobot, focusIndex, speakingIndex, listeningIndex }: Props) {
   return (
     <Canvas
-      camera={{ position: [0, 1.8, 9], fov: 52 }}
+      camera={{ position: [0, 1.8, 9], fov: 46 }}
       style={{ width: "100%", height: "100%" }}
       shadows
     >

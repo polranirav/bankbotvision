@@ -53,6 +53,10 @@ type FrontDeskReply = {
   should_route: boolean;
   route_target: "none" | "signup" | "login" | "magic_link";
   confidence: number;
+  risk_level?: "low" | "medium" | "high";
+  escalate?: boolean;
+  clarification_count?: number;
+  intent_module?: string;
 };
 
 export default function Home() {
@@ -85,6 +89,8 @@ export default function Home() {
   const [pendingMagicLink, setPendingMagicLink] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionError, setSessionError] = useState("");
+  // Session state echoed back to backend each turn
+  const [clarificationCount, setClarificationCount] = useState(0);
   const [lobbyStatus, setLobbyStatus] = useState(
     "Click an available desk and the agent will greet you.",
   );
@@ -310,6 +316,7 @@ export default function Home() {
     setPendingMagicLink(null);
     setMessages([]);
     setSessionError("");
+    setClarificationCount(0);
     setLobbyStatus("Click an available desk and the agent will greet you.");
   }
 
@@ -440,6 +447,12 @@ export default function Home() {
           history: messagesRef.current
             .slice(-8)
             .map((message) => ({ role: message.role, text: message.text })),
+          // Session state — backend uses these for intent routing + auth gating
+          clarification_count: clarificationCount,
+          auth_state: identityState === "confirmed" ? "confirmed"
+            : cameraState === "matched" ? "face_matched" : "none",
+          customer_type: cameraState === "new" ? "new"
+            : cameraState === "matched" ? "existing" : "unknown",
         }),
       });
 
@@ -453,10 +466,12 @@ export default function Home() {
         setIdentityState(cameraState === "matched" ? "confirmed" : identityState);
       }
 
+      // Echo session state back to backend on next turn
+      if (typeof decision.clarification_count === "number") {
+        setClarificationCount(decision.clarification_count);
+      }
+
       const action: AgentAction = {};
-      // TODO: signup/login routing is disabled until auth flow is built separately.
-      // For now, magic_link is the only routing that fires — everything else
-      // keeps the conversation going in the lobby.
       if (decision.should_route && decision.route_target === "magic_link" && pendingMagicLink) {
         action.magicLink = pendingMagicLink;
       } else {
@@ -778,33 +793,22 @@ export default function Home() {
               </button>
             </div>
 
-            {/* Bottom: minimal status dot — only visible while actively listening or thinking */}
-            {(sessionStage === "listening" || sessionStage === "processing") && (
-              <div className="absolute inset-x-0 bottom-8 z-40 flex justify-center">
-                <div className="flex items-center gap-2 rounded-full border border-white/8 bg-slate-950/50 px-4 py-2 backdrop-blur-xl">
-                  {sessionStage === "listening" ? (
-                    /* Animated waveform bars — compact */
-                    <div className="flex items-end gap-[2px]" style={{ height: 14 }}>
-                      {[0.4, 0.75, 1, 0.6, 0.9, 0.5, 0.8].map((base, i) => (
-                        <div
-                          key={i}
-                          className="w-[2px] rounded-full transition-all duration-75"
-                          style={{
-                            height: `${Math.max(2, Math.min(14, (vadLevel * base * 0.14) + 2))}px`,
-                            backgroundColor: selectedRobot.color,
-                            opacity: 0.55 + base * 0.45,
-                          }}
-                        />
-                      ))}
-                    </div>
-                  ) : (
-                    <span
-                      className="h-2 w-2 animate-spin rounded-full border border-white/20 border-t-white/60"
-                    />
-                  )}
-                </div>
-              </div>
-            )}
+            {/* Bottom: single status word — only when active */}
+            <div className="absolute inset-x-0 bottom-7 z-40 flex justify-center">
+              <span
+                className="text-[11px] font-light tracking-[0.32em] uppercase transition-all duration-300"
+                style={{
+                  color: sessionStage === "listening"
+                    ? selectedRobot.color
+                    : "rgba(255,255,255,0.28)",
+                  opacity: (sessionStage === "listening" || sessionStage === "processing" || isRobotSpeaking) ? 1 : 0,
+                }}
+              >
+                {sessionStage === "listening" ? "Listening"
+                  : isRobotSpeaking ? "Speaking"
+                  : "Thinking"}
+              </span>
+            </div>
           </>
         )}
       </main>

@@ -11,6 +11,23 @@ import logging
 import time
 from typing import Annotated, Literal
 
+
+# ── Pipeline latency timer ─────────────────────────────────────────────────────
+
+class _Timer:
+    """Lightweight per-request latency tracker."""
+    def __init__(self) -> None:
+        self._t0 = time.time()
+        self._marks: dict[str, int] = {}
+
+    def mark(self, name: str) -> None:
+        self._marks[name] = round((time.time() - self._t0) * 1000)
+
+    def log(self, logger: logging.Logger, prefix: str = "") -> None:
+        parts = "  ".join(f"{k}={v}ms" for k, v in self._marks.items())
+        total = round((time.time() - self._t0) * 1000)
+        logger.info("⏱  %s LATENCY  %s  total=%dms", prefix, parts, total)
+
 from fastapi import APIRouter, Header, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -58,6 +75,10 @@ class FrontDeskRequest(BaseModel):
     has_face_match: bool = False
     has_magic_link: bool = False
     history: list[DeskMessage] = []
+    # Session state — frontend echoes back what the backend last returned
+    clarification_count: int = 0
+    auth_state: Literal["none", "face_matched", "confirmed"] = "none"
+    customer_type: Literal["unknown", "existing", "new"] = "unknown"
 
 
 class FrontDeskResponse(BaseModel):
@@ -67,6 +88,11 @@ class FrontDeskResponse(BaseModel):
     should_route: bool = False
     route_target: Literal["none", "signup", "login", "magic_link"] = "none"
     confidence: float = 0.0
+    # Session state deltas — frontend stores and echoes back next turn
+    risk_level: Literal["low", "medium", "high"] = "low"
+    escalate: bool = False          # suggest human handoff
+    clarification_count: int = 0    # updated count to echo back
+    intent_module: str = "general"  # which module handled this turn
 
 
 # ── LangChain Tools (injected with user_id + supabase at call time) ───────────
@@ -517,43 +543,50 @@ def _make_tools(user_id: str, sb: Client):
 # ── Agent personalities ───────────────────────────────────────────────────────
 
 _TOOL_GUIDANCE = (
-    " Always use the right tool for the question — never guess numbers. "
-    "get_balance for balances, get_credit_info for credit, get_expenses or "
-    "get_spending_for_category for spending, get_profile for personal info, "
-    "get_account_summary for a full overview, transfer_between_accounts for "
-    "transfers, pay_credit_card for payments."
+    " Always use the right tool — never invent numbers. "
+    "get_balance for balances · get_credit_info for credit · get_expenses or "
+    "get_spending_for_category for spending · get_profile for personal info · "
+    "get_account_summary for a full overview · transfer_between_accounts for "
+    "transfers · pay_credit_card for card payments."
 )
 
-_VOICE_RULES = (
-    "\n\nCRITICAL — YOU ARE SPEAKING OUT LOUD TO A PERSON FACE-TO-FACE:\n"
-    "1. One thought at a time. 1-2 short spoken sentences MAX unless asked for more.\n"
-    "2. Convert all numbers to natural speech. Say 'two thousand three hundred dollars' "
-    "not '$2,300.00'. Say 'four hundred and fifty' not '$450.00'.\n"
-    "3. Never read raw formatted data, bullet points, tables, or line separators. "
-    "Translate tool output into a natural sentence.\n"
-    "4. Do NOT list menu options ('I can help with A, B, C, or D'). "
-    "Just answer the question or ask 'What would you like to know?'\n"
-    "5. Occasionally end with 'Anything else?' but not every turn — only when it feels natural.\n"
-    "6. If the customer asks multiple things, answer them all in one flowing sentence.\n"
-    "7. Resolve follow-up pronouns from context: 'it', 'that account', 'the other one'.\n"
-    "8. If something is ambiguous, ask ONE short clarifying question — never guess."
-)
+_VOICE_RULES = """
+
+UNIVERSAL BANKING CONVERSATION FLOW — follow this every turn:
+  1. INTENT  – identify what the customer actually needs in one phrase.
+  2. VERIFY  – if money movement, account changes, or sensitive data: confirm identity first.
+  3. EXECUTE – call the right tool. Never guess or fabricate data.
+  4. CONFIRM – repeat the outcome in one short sentence. ("Done. Transfer complete.")
+  5. CLOSE   – offer exactly ONE relevant next step, not a menu.
+
+VOICE FORMAT RULES (mandatory):
+  • One thought per response. 1–2 spoken sentences maximum.
+  • Natural English only. Speak numbers: "twelve hundred" not "$1,200.00".
+  • Never read raw tables, bullet lists, or separator lines from tool output.
+  • Before any transaction (transfer, payment): confirm explicitly.
+    Example: "You want to move three hundred dollars from chequing to savings — should I do that?"
+  • After completing an action: short confirmation only. "Done. Transfer complete."
+  • Offer ONE next step. Not five. ("Want to see the last three transactions?")
+  • Repair question if unsure twice: "Did you mean your debit card or credit card?"
+  • If a request needs escalation: "This one needs a specialist — want me to arrange that?"
+  • Never mention tools, APIs, or internal system names.
+  • Resolve pronouns from context: 'it', 'that account', 'the other one'.
+"""
 
 _ROBOT_SYSTEM: dict[str, str] = {
     "ARIA": (
-        "You are ARIA, a warm and friendly bank teller at BankBot Vision. "
-        "Speak naturally, like a real person — not a chatbot reading a screen. "
-        "Be welcoming and reassuring."
+        "You are ARIA, a professional and warm bank teller at BankBot Vision. "
+        "You speak naturally and briefly, like a trusted teller face-to-face."
         + _TOOL_GUIDANCE + _VOICE_RULES
     ),
     "MAX": (
-        "You are MAX, a fast and no-nonsense bank teller at BankBot Vision. "
-        "Get straight to the point — short answers, confident tone."
+        "You are MAX, a fast and precise bank teller at BankBot Vision. "
+        "Direct answers, short sentences, confident tone. No filler."
         + _TOOL_GUIDANCE + _VOICE_RULES
     ),
     "ZED": (
-        "You are ZED, a calm and thoughtful bank advisor at BankBot Vision. "
-        "Speak with measured confidence. Add a brief helpful insight where it genuinely helps."
+        "You are ZED, a calm and analytical banking advisor at BankBot Vision. "
+        "Measured confidence. One brief insight when it genuinely helps."
         + _TOOL_GUIDANCE + _VOICE_RULES
     ),
 }
@@ -694,6 +727,140 @@ def _compress_utterance(
         log.warning("   Lobby CQR failed: %s", e)
 
     return raw_utterance
+
+
+# ── Intent classification — fast keyword triage, no extra LLM call ────────────
+
+_INTENT_MAP: list[tuple[str, str, tuple[str, ...]]] = [
+    # (module, risk_level, keywords)
+    ("fraud_dispute",   "high",   ("suspicious", "fraud", "don't recognize", "dispute",
+                                   "unauthorized", "didn't make", "not mine", "scam")),
+    ("card_services",   "high",   ("lost card", "stolen card", "block card", "freeze card",
+                                   "unfreeze", "replacement card", "cancel card", "pin",
+                                   "spend limit", "travel notice")),
+    ("account_action",  "high",   ("transfer", "move money", "send money", "pay my",
+                                   "bill payment", "move from", "move to", "pay rogers",
+                                   "pay hydro", "pay bell", "chequing to savings",
+                                   "savings to chequing")),
+    ("account_read",    "medium", ("my balance", "check balance", "how much", "statement",
+                                   "transactions", "recent", "last few", "spending",
+                                   "expenses", "what did i spend", "credit score",
+                                   "available credit", "account summary", "my savings",
+                                   "my chequing", "overview")),
+    ("login_help",      "medium", ("can't log in", "locked", "forgot password",
+                                   "reset password", "otp", "verification code",
+                                   "access issue", "login help", "sign in problem")),
+    ("new_account",     "low",    ("open account", "new account", "join", "first time",
+                                   "become a customer", "sign up", "register", "apply",
+                                   "create account", "start an account")),
+    ("product_info",    "low",    ("which account", "best account", "compare", "recommend",
+                                   "cashback", "travel card", "low fee", "student account",
+                                   "business account", "interest rate", "mortgage rate")),
+    ("branch_appt",     "low",    ("branch", "location", "nearest", "in person",
+                                   "appointment", "talk to someone", "speak to a person",
+                                   "human", "advisor", "specialist", "callback")),
+]
+
+
+def _classify_intent(utterance: str) -> tuple[str, str]:
+    """Keyword triage → (intent_module, risk_level). O(n) with no LLM call."""
+    lower = utterance.lower()
+    for module, risk, keywords in _INTENT_MAP:
+        if any(k in lower for k in keywords):
+            return module, risk
+    return "general", "low"
+
+
+def _auth_gate(
+    risk_level: str,
+    payload: FrontDeskRequest,
+) -> FrontDeskResponse | None:
+    """Return a deflect response when the visitor's auth level is insufficient.
+
+    Returns None when the request can proceed normally.
+    """
+    if risk_level == "low":
+        return None  # public info — no auth needed
+
+    if risk_level == "medium" and payload.has_face_match:
+        return None  # face match is sufficient for read-only account data
+
+    if risk_level == "high" and payload.has_face_match and payload.has_magic_link:
+        return None  # full session available — proceed
+
+    # Not enough auth — deflect cleanly and calmly
+    name_part = f", {payload.recognised_name}" if payload.recognised_name else ""
+    if payload.has_face_match:
+        reply = (
+            f"I can help with that{name_part} — I just need to open a secure session first. "
+            "Shall I do that?"
+        )
+    else:
+        reply = "I can help with that. Could you confirm your name so I can verify you?"
+
+    return FrontDeskResponse(
+        summary="Auth insufficient for this request.",
+        reply=reply,
+        intent="account-help",
+        should_route=False,
+        route_target="none",
+        confidence=0.88,
+        risk_level=risk_level,
+        clarification_count=payload.clarification_count,
+        intent_module="auth_gate",
+    )
+
+
+# ── Module-specific prompt snippets injected into the system prompt ───────────
+
+_MODULE_PROMPTS: dict[str, str] = {
+    "account_read": (
+        "MODULE: Account Read. The visitor wants to see their account data. "
+        "Auth is already confirmed for this request. Retrieve and speak data naturally. "
+        "Say balances in plain English. Offer ONE follow-up only."
+    ),
+    "account_action": (
+        "MODULE: Account Action. MONEY MOVEMENT — highest risk. "
+        "Follow this exactly: (1) state what you understood, "
+        "(2) ask 'Should I proceed?' — wait for yes, "
+        "(3) execute, (4) confirm in one sentence. Never skip the confirmation step."
+    ),
+    "card_services": (
+        "MODULE: Card Services. Lead with empathy. "
+        "Offer the most urgent action first (block card). "
+        "Confirm before any irreversible step. "
+        "Ask: 'Do you want me to block it now and start a replacement?'"
+    ),
+    "fraud_dispute": (
+        "MODULE: Fraud Dispute. Stay calm and move quickly. "
+        "Ask for merchant name or amount to find the transaction. "
+        "Offer to flag it and protect the card immediately. "
+        "Escalate to specialist if visitor is distressed."
+    ),
+    "new_account": (
+        "MODULE: New Account. Guide with curiosity, not a menu. "
+        "Ask: 'Are you looking for everyday banking, savings, student, or business?' "
+        "Recommend the best fit in one sentence. Explain why in one phrase."
+    ),
+    "product_info": (
+        "MODULE: Product Info. Answer from general banking knowledge. "
+        "Focus on what the visitor actually needs — low fees, rewards, or savings rate. "
+        "Recommend one product with one clear reason."
+    ),
+    "login_help": (
+        "MODULE: Login Help. Ask which issue: locked account, forgotten password, or OTP. "
+        "Guide through the right resolution. "
+        "If repeated failure: 'This might need a specialist — want me to arrange that?'"
+    ),
+    "branch_appt": (
+        "MODULE: Branch / Appointment. Offer: find nearest branch OR book a specialist callback. "
+        "Ask which they prefer. Keep it simple — one sentence."
+    ),
+    "general": (
+        "MODULE: General. Respond naturally. "
+        "If intent is unclear, ask ONE focused clarifying question."
+    ),
+}
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -889,28 +1056,41 @@ def _fallback_frontdesk_response(payload: FrontDeskRequest) -> FrontDeskResponse
 
 
 def _frontdesk_system_prompt(robot_name: str) -> str:
-    return (
-        f"You are {robot_name.upper()}, a friendly bank teller at BankBot Vision's lobby. "
-        "You are having a spoken, face-to-face conversation — like a real bank visit.\n\n"
-        "Return a structured decision: summary, reply, intent, should_route, route_target, confidence.\n\n"
-        "CONVERSATION RULES (critical):\n"
-        "1. `reply` must sound like a real person speaking — warm, brief, natural. "
-        "1-2 sentences max. No bullet points, no menus, no lists of options.\n"
-        "2. NEVER say 'I can help with A, B, C, or D'. Instead ask 'What brings you in today?' "
-        "or 'Happy to help — what do you need?'\n"
-        "3. If the visitor's intent is clear, respond to it directly. Don't ask them to repeat.\n"
-        "4. If vague, ask ONE short clarifying question — not a menu.\n"
-        "5. Prefer keeping the conversation going over routing immediately.\n"
-        "6. Only set should_route=true when the visitor has clearly confirmed they want to proceed.\n"
-        "7. For account-sensitive requests (balances, credit, transactions), ask permission to "
-        "open a secure session first — don't route without consent.\n"
-        "8. For new-account requests, one gentle confirmation before routing (unless they said 'yes, start now').\n"
-        "9. If a recognised visitor with a magic link explicitly agrees to continue, use magic_link.\n"
-        "10. Never reveal internal logic, tool names, routing labels, or system fields in `reply`.\n"
-        "11. route_target: none | signup | login | magic_link\n"
-        "12. intent: open-account | documents | account-help | general | clarify\n"
-        "13. confidence: 0.0 – 1.0"
-    )
+    return f"""You are {robot_name}, a professional bank teller at BankBot Vision's lobby.
+You are speaking face-to-face with a visitor. Every response is spoken aloud.
+
+UNIVERSAL FLOW — follow for every turn:
+  1. WELCOME   – "Hi, what can I help you with today?" (first turn only)
+  2. INTENT    – understand what they actually need. Ask ONE clarifying question if unclear.
+  3. RISK CHECK– balance / transactions / card / account changes require secure sign-in.
+               Tell them calmly: "I can help — I just need to verify you first."
+  4. SOLVE     – answer general questions directly. Guide new customers. Explain products.
+  5. CONFIRM   – repeat the next step or outcome in one sentence.
+  6. CLOSE     – offer ONE relevant next action. Nothing more.
+
+SCRIPT PATTERNS (use these as natural language templates):
+  Balance:      "I can pull that up, but I'll need to verify your identity first."
+  Transactions: "Happy to show those — I just need you to sign in securely."
+  Transfer:     "I can do that transfer after a quick identity check."
+  New account:  "Welcome! Are you looking for everyday banking, savings, student, or business?"
+  Lost card:    "I'm sorry about that. I can block it now and arrange a replacement. Shall I start?"
+  Suspicious:   "I can flag that and start a dispute — tell me the merchant name or amount."
+  Product Q:    "What matters most — low fees, cashback, or savings growth?"
+  Escalation:   "This one needs a specialist. I can connect you so you won't need to repeat yourself."
+
+REPLY RULES:
+  • 1–2 spoken sentences only. Natural English. Warm, professional.
+  • One question per turn. Never list more than two options.
+  • No menus, no bullet lists, no 'I can help with A, B, C, or D'.
+  • Never mention routing labels, internal tools, or system logic.
+  • If confidence is low after two attempts, offer specialist handoff.
+
+ROUTING (routing is restricted — most flows stay in lobby):
+  • should_route=true ONLY when visitor has confirmed AND magic_link is available.
+  • All other should_route decisions: false. Keep talking.
+  • route_target: none | magic_link
+  • intent: open-account | account-help | documents | general | clarify
+  • confidence: 0.0–1.0"""
 
 
 def _normalize_frontdesk_decision(
@@ -957,10 +1137,10 @@ def agent_query(
     - Authenticated: full banking tools scoped to the user
     - Unauthenticated: general banking assistant (no tools)
     """
-    t0 = time.time()
+    timer = _Timer()
     log.info("\n" + "═" * 60)
-    log.info("🤖 AGENT QUERY  robot=%s  history_turns=%d", payload.robot_name, len(payload.history))
-    log.info("   User said: %r", payload.question)
+    log.info("🤖 AGENT QUERY  robot=%s  history=%d", payload.robot_name, len(payload.history))
+    log.info("   User: %r", payload.question)
     log.info("═" * 60)
 
     if not settings.openai_api_key:
@@ -970,12 +1150,13 @@ def agent_query(
 
     llm = ChatOpenAI(
         model="gpt-4o-mini",
-        temperature=0.3,
+        temperature=0.2,
         api_key=settings.openai_api_key,
     )
 
     # ── Step 1: Contextual Query Rewriting ────────────────────────────────
     clean_query = _rewrite_query(payload.question, payload.history, llm)
+    timer.mark("cqr")
 
     # ── Step 2: Build conversation history as LangChain messages ─────────
     history_messages: list[HumanMessage | AIMessage] = []
@@ -1046,9 +1227,9 @@ def agent_query(
             return result.content
 
     answer = _run_agent()
-
-    elapsed = time.time() - t0
-    log.info("\n✅ ANSWER (%.1fs): %s", elapsed, answer[:120] + ("…" if len(answer) > 120 else ""))
+    timer.mark("llm_done")
+    timer.log(log, "AGENT_QUERY")
+    log.info("✅ ANSWER: %s", answer[:120] + ("…" if len(answer) > 120 else ""))
     log.info("─" * 60)
 
     return QueryResponse(
@@ -1063,57 +1244,99 @@ def agent_query(
     tags=["frontdesk", "lobby"],
 )
 def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
-    """Compress raw speech → clean intent → structured routing decision."""
+    """Intent triage → auth gate → optional CQR → module LLM → normalize."""
+    timer = _Timer()
+
     llm = ChatOpenAI(
         model="gpt-4o-mini",
-        temperature=0.2,
+        temperature=0.15,
         api_key=settings.openai_api_key,
     )
 
-    # Step 1: compress messy voice input into clean intent
+    # ── Step 1: Fast keyword intent + risk classification (no LLM) ───────────
+    intent_module, risk_level = _classify_intent(payload.utterance)
+    timer.mark("intent")
+    log.info("   🎯 Module: %s  Risk: %s", intent_module, risk_level)
+
+    # ── Step 2: Auth gate — deflect without LLM if auth is insufficient ──────
+    gate = _auth_gate(risk_level, payload)
+    if gate:
+        timer.mark("auth_gate")
+        timer.log(log, "FRONTDESK")
+        return gate
+
+    # ── Step 3: Clarification limit — offer specialist after 2 retries ───────
+    if payload.clarification_count >= 2 and intent_module == "general":
+        timer.log(log, "FRONTDESK")
+        return FrontDeskResponse(
+            summary="Repeated clarification failure — escalate.",
+            reply="I want to make sure I get this right for you. Would you like to speak with a specialist who can help directly?",
+            intent="clarify",
+            confidence=0.4,
+            escalate=True,
+            risk_level=risk_level,
+            intent_module="escalation",
+            clarification_count=payload.clarification_count,
+        )
+
+    # ── Step 4: Optional CQR — skip for short utterances ────────────────────
     clean_utterance = _compress_utterance(payload.utterance, payload.history, llm)
+    timer.mark("cqr")
     if clean_utterance != payload.utterance:
         log.info("   🗜️  Compressed: %r → %r", payload.utterance[:60], clean_utterance[:60])
 
+    # ── Step 5: LLM structured output with module-specific prompt ────────────
+    module_guidance = _MODULE_PROMPTS.get(intent_module, _MODULE_PROMPTS["general"])
+    system_content = _frontdesk_system_prompt(payload.robot_name) + f"\n\n{module_guidance}"
     structured_llm = llm.with_structured_output(FrontDeskResponse)
 
     history_lines = "\n".join(
-        f"{msg.role.upper()}: {msg.text}" for msg in payload.history[-8:]
-    ) or "No prior conversation."
+        f"{msg.role.upper()}: {msg.text}" for msg in payload.history[-6:]
+    ) or "First turn."
 
-    recognized_context = (
-        f"Recognized name: {payload.recognised_name}. "
-        if payload.recognised_name
-        else "Recognized name: none. "
-    )
-    session_context = (
-        f"{recognized_context}"
-        f"Face match available: {payload.has_face_match}. "
-        f"Magic link ready: {payload.has_magic_link}."
+    name_ctx = f"Recognised: {payload.recognised_name}." if payload.recognised_name else "Visitor unrecognised."
+    session_ctx = (
+        f"{name_ctx} Face match: {payload.has_face_match}. "
+        f"Magic link: {payload.has_magic_link}. Auth: {payload.auth_state}. "
+        f"Customer type: {payload.customer_type}. Risk: {risk_level}."
     )
 
-    # Step 2: routing decision using compressed utterance
+    timer.mark("llm_start")
     decision = structured_llm.invoke(
         [
-            SystemMessage(content=_frontdesk_system_prompt(payload.robot_name)),
+            SystemMessage(content=system_content),
             HumanMessage(
                 content=(
-                    f"Session context:\n{session_context}\n\n"
-                    f"Recent conversation:\n{history_lines}\n\n"
-                    f"Visitor said (compressed from raw speech):\n{clean_utterance}"
+                    f"Session:\n{session_ctx}\n\n"
+                    f"Recent turns:\n{history_lines}\n\n"
+                    f"Visitor:\n{clean_utterance}"
                 )
             ),
         ],
         config={
-            "run_name": f"[{payload.robot_name}] {clean_utterance[:60]}",
+            "run_name": f"[{payload.robot_name}/{intent_module}] {clean_utterance[:55]}",
             "metadata": {
                 "robot": payload.robot_name,
                 "visitor": payload.recognised_name or "guest",
-                "face_match": payload.has_face_match,
-                "raw_utterance": payload.utterance,
-                "compressed_utterance": clean_utterance,
+                "intent_module": intent_module,
+                "risk_level": risk_level,
+                "raw": payload.utterance,
+                "compressed": clean_utterance,
+                "auth_state": payload.auth_state,
+                "clarification_count": payload.clarification_count,
             },
         },
+    )
+    timer.mark("llm_done")
+    timer.log(log, "FRONTDESK")
+
+    # Attach session state updates so frontend can echo them back
+    decision.risk_level = risk_level
+    decision.intent_module = intent_module
+    decision.clarification_count = (
+        payload.clarification_count + 1
+        if decision.intent == "clarify"
+        else 0  # reset counter on successful understanding
     )
     return _normalize_frontdesk_decision(decision, payload)
 
