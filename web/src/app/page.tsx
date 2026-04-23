@@ -65,6 +65,10 @@ export default function Home() {
   const vadAudioCtxRef = useRef<AudioContext | null>(null);
   const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoListenEnabledRef = useRef(false);
+  // Generation counter — prevents cancelled utterances from firing finishAgentAction
+  const speechGenRef = useRef(0);
+  // True while TTS is actively playing — prevents VAD from starting mid-speech
+  const isSpeakingRef = useRef(false);
   const [vadLevel, setVadLevel] = useState(0); // 0–100, for waveform indicator
 
   const [authFirstName, setAuthFirstName] = useState<string | null>(null);
@@ -182,37 +186,51 @@ export default function Home() {
       return;
     }
 
+    // Cancel any in-flight speech — the old utterance's onerror will fire with
+    // error="canceled" and we guard against it below so it won't trigger VAD.
     window.speechSynthesis.cancel();
     if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
+
+    // Bump generation — any done() closure from a previous speakAgent call
+    // will see a stale generation and bail out immediately.
+    const gen = ++speechGenRef.current;
+    isSpeakingRef.current = true;
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1;
     utterance.pitch = selectedRobot?.name === "ZED" ? 0.9 : 1.03;
 
-    // Safety net: always fire finishAgentAction even if onend never fires
-    // (Chrome sometimes silently drops speech when user-gesture chain is broken)
+    // Safety timeout: fire done() even if onend never fires.
     const estimatedMs = Math.max(2500, text.length * 65);
-    let fired = false;
+
     const done = () => {
-      if (fired) return;
-      fired = true;
+      // Stale if a newer speakAgent call has started
+      if (speechGenRef.current !== gen) return;
+      isSpeakingRef.current = false;
       if (speechTimeoutRef.current) clearTimeout(speechTimeoutRef.current);
       finishAgentAction(action);
     };
 
-    utterance.onend = done;
-    utterance.onerror = done;
-    speechTimeoutRef.current = setTimeout(done, estimatedMs);
-
-    // Chrome macOS bug: speech synthesis pauses if not nudged
+    // Chrome macOS bug: speech synthesis can pause if not nudged every few seconds
     const resumeInterval = setInterval(() => {
-      if (!window.speechSynthesis.speaking) { clearInterval(resumeInterval); return; }
+      if (!window.speechSynthesis.speaking || speechGenRef.current !== gen) {
+        clearInterval(resumeInterval);
+        return;
+      }
       window.speechSynthesis.pause();
       window.speechSynthesis.resume();
     }, 5000);
-    utterance.onend = () => { clearInterval(resumeInterval); done(); };
-    utterance.onerror = () => { clearInterval(resumeInterval); done(); };
 
+    utterance.onend = () => { clearInterval(resumeInterval); done(); };
+    utterance.onerror = (e) => {
+      clearInterval(resumeInterval);
+      // "canceled" means we called cancel() intentionally — do NOT fire done()
+      // because a newer speakAgent call is already in progress.
+      if ((e as SpeechSynthesisErrorEvent).error === "canceled") return;
+      done();
+    };
+
+    speechTimeoutRef.current = setTimeout(done, estimatedMs);
     window.speechSynthesis.speak(utterance);
   }
 
@@ -247,9 +265,16 @@ export default function Home() {
 
     // Speak FIRST — must happen synchronously within the click gesture.
     speakAgent(
-      `Hello! Welcome to BankBot Vision. I'm ${robot.name}. Let me scan your face, then tell me how I can help you today.`,
+      `Hi, welcome! I'm ${robot.name}. Just give me a moment to see if I recognise you.`,
       { autoListen: true },
     );
+
+    // Fallback: if face scan hasn't resolved in 9 seconds, treat as new visitor
+    // so the conversation can start without a face match.
+    setTimeout(() => {
+      setCameraState((s) => (s === "waiting" || s === "matching" ? "new" : s));
+      setIdentityState((id) => (id === "unknown" ? "guest" : id));
+    }, 9000);
 
     // Request mic after — safe because speech already unlocked above.
     await requestMicrophone();
@@ -318,7 +343,7 @@ export default function Home() {
         setSessionStage("ready");
         setIdentityState("guest");
         speakAgent(
-          "Hello and welcome. I do not see an existing account yet. Tell me your first name and how I can help you today. I can help with opening an account, documents, or general banking questions.",
+          "I don't see you in our system yet — looks like you might be new here. What can I help you with today?",
           { autoListen: true },
         );
         return;
@@ -330,7 +355,7 @@ export default function Home() {
       setCameraState("matched");
       setSessionStage("ready");
       speakAgent(
-        `Hello. I think I recognised you as ${data.first_name}. Please tell me your first name so I can confirm, then I can help with balances, cards, documents, or account opening.`,
+        `I think I recognise you — are you ${data.first_name}? Just confirm your name and I'll pull up your account.`,
         { autoListen: true },
       );
     } catch (error) {
@@ -339,7 +364,7 @@ export default function Home() {
       setIdentityState("guest");
       setSessionError(error instanceof Error ? error.message : "Face recognition is unavailable right now.");
       speakAgent(
-        "Hello, welcome. I couldn't complete recognition, but we can still continue. Tell me your first name and how I can help you today.",
+        "Face scan had a little trouble, but no worries — I can still help. What's your name and what brings you in today?",
         { autoListen: true },
       );
     }
@@ -351,13 +376,18 @@ export default function Home() {
     setIdentityState("guest");
     setSessionError(message);
     speakAgent(
-      "Hello, welcome. Face recognition is having trouble right now, but I can still help you. Tell me your first name and how I can help today.",
+      "I'm having trouble with the camera, but that's okay. Tell me your name and what I can help you with.",
       { autoListen: true },
     );
   }
 
   async function processVisitorRequest(text: string) {
     if (!selectedRobot) return;
+
+    // Once the visitor starts talking, stop face scanning — we don't want
+    // a late scan result interrupting an ongoing conversation.
+    setCameraState((s) => (s === "waiting" || s === "matching" ? "new" : s));
+    setIdentityState((id) => (id === "unknown" ? "guest" : id));
 
     const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
     const encodedAgent = encodeURIComponent(selectedRobot.name);
@@ -376,7 +406,7 @@ export default function Home() {
         setIdentityState("confirmed");
         setSessionStage("ready");
         speakAgent(
-          `Thank you, ${recognisedName}. How can I help you today? I can help with balances, cards, documents, or opening an account.`,
+          `Great to see you, ${recognisedName}! What can I help you with today?`,
           { autoListen: micGranted && speechSupported },
         );
         return;
@@ -386,7 +416,7 @@ export default function Home() {
         setIdentityState("confirmed");
         setSessionStage("ready");
         speakAgent(
-          `Thank you. I may confirm the profile securely again in a moment. How can I help you today? I can help with balances, cards, documents, or opening an account.`,
+          `Thanks for that. What can I help you with today?`,
           { autoListen: micGranted && speechSupported },
         );
         return;
@@ -439,7 +469,7 @@ export default function Home() {
       setSessionStage("ready");
       setSessionError(error instanceof Error ? error.message : "I couldn't process that request clearly.");
       speakAgent(
-        "I am still with you. Tell me the main thing you need help with today, and I will take it step by step.",
+        "Sorry, I didn't quite catch that. What did you need?",
         { autoListen: micGranted && speechSupported },
       );
     }
@@ -459,6 +489,11 @@ export default function Home() {
     if (!autoListenEnabledRef.current) return;
     if (mediaRecorderRef.current?.state === "recording") return;
     if (typeof window === "undefined" || !("MediaRecorder" in window)) return;
+    // Don't start recording while the robot is still speaking — we'd capture TTS audio
+    if (isSpeakingRef.current) {
+      setTimeout(() => startVADListen(), 300);
+      return;
+    }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
