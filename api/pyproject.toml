@@ -12,6 +12,14 @@ dependencies = [
     "python-jose[cryptography]>=3.3",
     "httpx>=0.27",
     "numpy>=2.4.4",
+    "openai>=2.32.0",
+    "langchain>=1.2.15",
+    "langchain-openai>=1.1.16",
+    "langchain-community>=0.4.1",
+    "python-multipart>=0.0.26",
+    "faster-whisper>=1.1.0",
+    "deepface>=0.0.93",
+    "tf-keras>=2.19",
 ]
 
 [project.optional-dependencies]

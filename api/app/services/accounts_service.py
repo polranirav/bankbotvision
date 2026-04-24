@@ -6,30 +6,40 @@ from supabase import Client
 from ..models.account import AccountCreate, AccountUpdate
 
 
+def _safe(row: dict) -> dict:
+    """Strip raw pin from DB row and add has_pin boolean."""
+    row = dict(row)
+    row["has_pin"] = bool(row.get("pin"))
+    row.pop("pin", None)
+    return row
+
+
 def create_account(sb: Client, user_id: str, payload: AccountCreate) -> dict:
     row = payload.model_dump(mode="json")
     row["user_id"] = user_id
     res = sb.table("accounts").insert(row).execute()
     if not res.data:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "insert failed")
-    return res.data[0]
+    return _safe(res.data[0])
 
 
 def get_account(sb: Client, user_id: str) -> dict:
     res = sb.table("accounts").select("*").eq("user_id", user_id).maybe_single().execute()
     if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
-    return res.data
+    return _safe(res.data)
 
 
 def update_account(sb: Client, user_id: str, payload: AccountUpdate) -> dict:
     patch = payload.model_dump(mode="json", exclude_none=True)
+    # Strip empty strings (e.g. pin="")
+    patch = {k: v for k, v in patch.items() if v != ""}
     if not patch:
         return get_account(sb, user_id)
     res = sb.table("accounts").update(patch).eq("user_id", user_id).execute()
     if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "account not found")
-    return res.data[0]
+    return _safe(res.data[0])
 
 
 def list_expenses(sb: Client, user_id: str, months: int = 3) -> list[dict]:

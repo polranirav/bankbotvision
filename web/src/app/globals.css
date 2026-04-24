@@ -5,3 +5,50 @@
 :root {
   color-scheme: light dark;
 }
+
+/* ── Cyberpunk lobby atmosphere ── */
+@keyframes neon-flicker {
+  0%, 19%, 21%, 23%, 25%, 54%, 56%, 100% { opacity: 1; }
+  20%, 24%, 55% { opacity: 0.3; }
+}
+
+@keyframes neon-flicker-b {
+  0%, 28%, 32%, 35%, 73%, 76%, 100% { opacity: 0.85; }
+  29%, 33%, 74% { opacity: 0.15; }
+}
+
+@keyframes horizon-breathe {
+  0%, 100% { opacity: 0.55; }
+  50%       { opacity: 1;    }
+}
+
+@keyframes grid-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%       { opacity: 0.7;  }
+}
+
+@keyframes corner-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 0.95; }
+}
+
+@keyframes cyber-particle {
+  0%   { transform: translate(0, 0);        opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 0.7; }
+  100% { transform: translate(15px, -95px); opacity: 0; }
+}
+
+@keyframes cyber-particle-b {
+  0%   { transform: translate(0, 0);         opacity: 0; }
+  10%  { opacity: 0.8; }
+  90%  { opacity: 0.45; }
+  100% { transform: translate(-12px, -80px); opacity: 0; }
+}
+
+@keyframes scan-sweep {
+  0%   { transform: translateY(-2px); opacity: 0; }
+  5%   { opacity: 1; }
+  95%  { opacity: 0.6; }
+  100% { transform: translateY(100vh); opacity: 0; }
+}

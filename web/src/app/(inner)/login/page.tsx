@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { FaceCapture, type CaptureResult } from "@/components/FaceCapture";
@@ -10,10 +10,20 @@ type Mode = "choose" | "email" | "face";
 export default function LoginPage() {
   const router = useRouter();
   const [mode, setMode] = useState<Mode>("choose");
+  const [agentName, setAgentName] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const queryMode = params.get("mode");
+    setAgentName(params.get("agent"));
+    if (queryMode === "email" || queryMode === "face") {
+      setMode(queryMode);
+    }
+  }, []);
 
   async function handleEmail(e: React.FormEvent) {
     e.preventDefault();
@@ -27,22 +37,34 @@ export default function LoginPage() {
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/face/match`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/face/detect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ descriptor: result.descriptor }),
+        body: JSON.stringify({ image_data_url: result.imageDataUrl }),
       });
 
       if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: "Face not recognised" }));
-        setError(body.detail ?? "Face not recognised");
+        const body = await res.json().catch(() => ({ detail: "Face detection failed" }));
+        setError(body.detail ?? "Face detection failed");
         setMode("choose");
         return;
       }
 
-      const { magic_link } = await res.json();
+      const data = await res.json();
+      if (!data.detected) {
+        // Just let it keep trying if it didn't find a face
+        setBusy(false);
+        return;
+      }
+
+      if (!data.matched) {
+        setError("Face not recognised. Please try again or use email.");
+        setMode("choose");
+        return;
+      }
+
       // Follow the magic link — Supabase sets the session cookie then redirects back
-      window.location.href = magic_link;
+      window.location.href = data.magic_link;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setMode("choose");
@@ -54,6 +76,11 @@ export default function LoginPage() {
   return (
     <div className="space-y-6 py-10 max-w-sm">
       <h1 className="text-2xl font-semibold">Log in</h1>
+      {agentName && (
+        <p className="text-sm text-neutral-500">
+          You walked up to {agentName}. Continue with the sign-in option that fits your visit.
+        </p>
+      )}
 
       {mode === "choose" && (
         <div className="flex flex-col gap-3">

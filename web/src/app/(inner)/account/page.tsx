@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { api } from "@/lib/api";
 import { AccountForm } from "@/components/AccountForm";
+import { FaceCapture, type CaptureResult } from "@/components/FaceCapture";
 import type { Account } from "@/types/account";
 
 type Expense = { id: number; category: string; amount: string; occurred_at: string };
@@ -43,6 +44,17 @@ export default function AccountPage() {
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Face ID panel state
+  const [facePanel, setFacePanel] = useState<"closed" | "register" | "confirm-delete">("closed");
+  const [faceBusy, setFaceBusy] = useState(false);
+  const [faceMsg, setFaceMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  // PIN panel state
+  const [pinPanel, setPinPanel] = useState(false);
+  const [pinValue, setPinValue] = useState("");
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinMsg, setPinMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
   useEffect(() => {
     (async () => {
       const { data } = await supabase.auth.getSession();
@@ -62,10 +74,84 @@ export default function AccountPage() {
     })();
   }, [router]);
 
-  async function handleUpdate(values: Parameters<typeof AccountForm>[0]["initial"]) {
+  async function handleUpdate(values: Record<string, unknown>) {
     const updated = await api<Account>("/accounts/me", { method: "PUT", body: JSON.stringify(values) });
     setAccount(updated);
     setEditing(false);
+  }
+
+  async function handlePinSave() {
+    if (pinValue.length !== 4 || !/^\d{4}$/.test(pinValue)) {
+      setPinMsg({ type: "err", text: "PIN must be exactly 4 digits." });
+      return;
+    }
+    setPinBusy(true);
+    setPinMsg(null);
+    try {
+      const updated = await api<Account>("/accounts/me", {
+        method: "PUT",
+        body: JSON.stringify({ pin: pinValue }),
+      });
+      setAccount(updated);
+      setPinMsg({ type: "ok", text: "PIN saved successfully." });
+      setPinValue("");
+      setPinPanel(false);
+    } catch (e) {
+      setPinMsg({ type: "err", text: e instanceof Error ? e.message : "Could not save PIN." });
+    } finally {
+      setPinBusy(false);
+    }
+  }
+
+  // ── Face ID: register / update ──────────────────────────────────────────
+  async function handleFaceCapture(result: CaptureResult) {
+    setFaceBusy(true);
+    setFaceMsg(null);
+    try {
+      await api("/face/save", {
+        method: "POST",
+        body: JSON.stringify({ image_data_url: result.imageDataUrl }),
+      });
+      // Refresh account to pick up new face_image_path
+      const updated = await api<Account>("/accounts/me");
+      setAccount(updated);
+      setFaceMsg({ type: "ok", text: "Face ID registered successfully." });
+      setFacePanel("closed");
+    } catch (e) {
+      setFaceMsg({ type: "err", text: e instanceof Error ? e.message : "Could not save face." });
+    } finally {
+      setFaceBusy(false);
+    }
+  }
+
+  // ── Face ID: delete ──────────────────────────────────────────────────────
+  async function handleFaceDelete() {
+    setFaceBusy(true);
+    setFaceMsg(null);
+    try {
+      // Clear face fields via account update endpoint
+      await api("/face/delete", { method: "DELETE" });
+      const updated = await api<Account>("/accounts/me");
+      setAccount(updated);
+      setFaceMsg({ type: "ok", text: "Face ID removed." });
+      setFacePanel("closed");
+    } catch (e) {
+      // Fallback: clear via accounts update if /face/delete not present
+      try {
+        await api("/accounts/me", {
+          method: "PUT",
+          body: JSON.stringify({ face_descriptor: null, face_image_path: null }),
+        });
+        const updated = await api<Account>("/accounts/me");
+        setAccount(updated);
+        setFaceMsg({ type: "ok", text: "Face ID removed." });
+        setFacePanel("closed");
+      } catch {
+        setFaceMsg({ type: "err", text: e instanceof Error ? e.message : "Could not remove face." });
+      }
+    } finally {
+      setFaceBusy(false);
+    }
   }
 
   async function signOut() {
@@ -77,6 +163,7 @@ export default function AccountPage() {
   if (error)   return <div className="py-20 text-center text-red-500">{error}</div>;
   if (!account) return null;
 
+  const hasFaceId = Boolean(account.face_image_path);
   const creditUsedPct = account.credit_limit && Number(account.credit_limit) > 0
     ? Math.min(100, (Number(account.credit_balance) / Number(account.credit_limit)) * 100)
     : 0;
@@ -87,14 +174,12 @@ export default function AccountPage() {
   return (
     <div className="space-y-6 py-8">
 
-      {/* Header */}
+      {/* ── Header ── */}
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-semibold">{greeting}, {account.first_name} 👋</h1>
           <p className="text-sm text-neutral-500 mt-0.5">
-            {account.face_image_path
-              ? "🟢 Face ID registered"
-              : "⚪ No Face ID — go to signup to register"}
+            {hasFaceId ? "🟢 Face ID active" : "⚪ No Face ID set up"}
           </p>
         </div>
         <div className="flex gap-2">
@@ -107,7 +192,7 @@ export default function AccountPage() {
         </div>
       </div>
 
-      {/* Edit form */}
+      {/* ── Edit form ── */}
       {editing && (
         <div className="rounded-xl border border-neutral-200 p-5 bg-neutral-50">
           <h2 className="text-sm font-semibold mb-4 text-neutral-700">Edit Account</h2>
@@ -127,7 +212,165 @@ export default function AccountPage() {
         </div>
       )}
 
-      {/* Balance cards */}
+      {/* ── Face ID card ── */}
+      <div className="rounded-xl border border-neutral-200 p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-full text-xl ${hasFaceId ? "bg-green-50" : "bg-neutral-100"}`}>
+              {hasFaceId ? "🟢" : "⚪"}
+            </div>
+            <div>
+              <p className="text-sm font-semibold">Face ID</p>
+              <p className="text-xs text-neutral-500">
+                {hasFaceId
+                  ? "Registered — the lobby robot will recognise you automatically"
+                  : "Not set up — add it so the robot greets you by name"}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            {hasFaceId ? (
+              <>
+                <button
+                  onClick={() => { setFacePanel("register"); setFaceMsg(null); }}
+                  className="rounded border border-neutral-200 px-3 py-1.5 text-xs hover:bg-neutral-50"
+                >
+                  Update
+                </button>
+                <button
+                  onClick={() => { setFacePanel("confirm-delete"); setFaceMsg(null); }}
+                  className="rounded border border-red-200 px-3 py-1.5 text-xs text-red-600 hover:bg-red-50"
+                >
+                  Remove
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => { setFacePanel("register"); setFaceMsg(null); }}
+                className="rounded bg-neutral-900 px-3 py-1.5 text-xs text-white hover:bg-neutral-700"
+              >
+                Set up Face ID
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Status message */}
+        {faceMsg && (
+          <p className={`text-sm ${faceMsg.type === "ok" ? "text-green-600" : "text-red-500"}`}>
+            {faceMsg.text}
+          </p>
+        )}
+
+        {/* Register / Update panel */}
+        {facePanel === "register" && (
+          <div className="border-t border-neutral-100 pt-4 space-y-3">
+            <p className="text-sm text-neutral-600">
+              Look directly at the camera, then click <strong>Capture face</strong>.
+            </p>
+            <FaceCapture
+              onCapture={handleFaceCapture}
+              onError={(msg) => setFaceMsg({ type: "err", text: msg })}
+            />
+            {faceBusy && <p className="text-sm text-neutral-500">Saving…</p>}
+            <button
+              onClick={() => setFacePanel("closed")}
+              className="text-xs text-neutral-400 hover:text-neutral-600"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {/* Confirm delete panel */}
+        {facePanel === "confirm-delete" && (
+          <div className="border-t border-neutral-100 pt-4 space-y-3">
+            <p className="text-sm text-neutral-700">
+              Are you sure you want to remove your Face ID? The lobby robot won't be able to recognise you until you set it up again.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={handleFaceDelete}
+                disabled={faceBusy}
+                className="rounded bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-500 disabled:opacity-50"
+              >
+                {faceBusy ? "Removing…" : "Yes, remove Face ID"}
+              </button>
+              <button
+                onClick={() => setFacePanel("closed")}
+                className="rounded border border-neutral-200 px-4 py-2 text-sm hover:bg-neutral-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Robot PIN card ── */}
+      <div className="rounded-xl border border-neutral-200 p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-full text-xl ${account.has_pin ? "bg-green-50" : "bg-neutral-100"}`}>
+              {account.has_pin ? "🔐" : "🔓"}
+            </div>
+            <div>
+              <p className="text-sm font-semibold">Robot PIN</p>
+              <p className="text-xs text-neutral-500">
+                {account.has_pin
+                  ? "PIN is set — say it when the robot asks to access your account"
+                  : "No PIN set — you won't be able to access account details via the robot"}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => { setPinPanel(!pinPanel); setPinMsg(null); setPinValue(""); }}
+            className="rounded border border-neutral-200 px-3 py-1.5 text-xs hover:bg-neutral-50"
+          >
+            {account.has_pin ? "Change PIN" : "Set PIN"}
+          </button>
+        </div>
+
+        {pinMsg && (
+          <p className={`text-sm ${pinMsg.type === "ok" ? "text-green-600" : "text-red-500"}`}>
+            {pinMsg.text}
+          </p>
+        )}
+
+        {pinPanel && (
+          <div className="border-t border-neutral-100 pt-4 space-y-3">
+            <p className="text-sm text-neutral-600">Enter a 4-digit PIN. You will say this to the robot to verify your identity.</p>
+            <div className="flex items-center gap-3">
+              <input
+                type="password"
+                inputMode="numeric"
+                pattern="[0-9]{4}"
+                maxLength={4}
+                placeholder="••••"
+                value={pinValue}
+                onChange={(e) => setPinValue(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                className="w-24 rounded border border-neutral-300 px-3 py-2 text-center text-lg tracking-widest"
+              />
+              <button
+                onClick={handlePinSave}
+                disabled={pinBusy || pinValue.length !== 4}
+                className="rounded bg-neutral-900 px-4 py-2 text-sm text-white hover:bg-neutral-700 disabled:opacity-40"
+              >
+                {pinBusy ? "Saving…" : "Save PIN"}
+              </button>
+              <button
+                onClick={() => { setPinPanel(false); setPinValue(""); setPinMsg(null); }}
+                className="text-xs text-neutral-400 hover:text-neutral-600"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Balance cards ── */}
       <div className="grid grid-cols-3 gap-4">
         <div className="rounded-xl border border-neutral-200 p-4 space-y-1">
           <p className="text-xs text-neutral-500 uppercase tracking-wide">Chequing</p>
@@ -149,7 +392,7 @@ export default function AccountPage() {
         </div>
       </div>
 
-      {/* Credit score */}
+      {/* ── Credit score ── */}
       {account.credit_score && (
         <div className="rounded-xl border border-neutral-200 p-4">
           <div className="flex items-center justify-between mb-3">
@@ -160,9 +403,11 @@ export default function AccountPage() {
         </div>
       )}
 
-      {/* Recent expenses */}
+      {/* ── Recent expenses ── */}
       <div className="rounded-xl border border-neutral-200 p-4">
-        <p className="text-sm font-semibold mb-3">Recent Expenses <span className="text-neutral-400 font-normal text-xs">(last 3 months)</span></p>
+        <p className="text-sm font-semibold mb-3">
+          Recent Expenses <span className="text-neutral-400 font-normal text-xs">(last 3 months)</span>
+        </p>
         {expenses.length === 0 ? (
           <p className="text-sm text-neutral-400">No expenses recorded yet.</p>
         ) : (
@@ -173,7 +418,9 @@ export default function AccountPage() {
                   <span className="text-lg">{CATEGORY_EMOJI[e.category] ?? "💳"}</span>
                   <div>
                     <p className="text-sm font-medium capitalize">{e.category}</p>
-                    <p className="text-xs text-neutral-400">{new Date(e.occurred_at).toLocaleDateString("en-CA", { month: "short", day: "numeric" })}</p>
+                    <p className="text-xs text-neutral-400">
+                      {new Date(e.occurred_at).toLocaleDateString("en-CA", { month: "short", day: "numeric" })}
+                    </p>
                   </div>
                 </div>
                 <span className="text-sm font-semibold">{fmt(e.amount)}</span>
@@ -183,12 +430,14 @@ export default function AccountPage() {
         )}
       </div>
 
-      {/* Account info footer */}
+      {/* ── Account info footer ── */}
       <div className="rounded-xl border border-neutral-200 p-4 text-sm text-neutral-500 space-y-1">
         <p><span className="font-medium text-neutral-700">Name</span>: {account.first_name} {account.last_name}</p>
         {account.address && <p><span className="font-medium text-neutral-700">Address</span>: {account.address}</p>}
         {account.date_of_birth && <p><span className="font-medium text-neutral-700">Date of birth</span>: {account.date_of_birth}</p>}
-        <p className="text-xs text-neutral-300 pt-1">Member since {new Date(account.created_at).toLocaleDateString("en-CA", { month: "long", year: "numeric" })}</p>
+        <p className="text-xs text-neutral-300 pt-1">
+          Member since {new Date(account.created_at).toLocaleDateString("en-CA", { month: "long", year: "numeric" })}
+        </p>
       </div>
 
     </div>

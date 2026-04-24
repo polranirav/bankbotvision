@@ -1,7 +1,15 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def _validate_pin(v: str | None) -> str | None:
+    if v is None or v == "":
+        return None
+    if not v.isdigit() or len(v) != 4:
+        raise ValueError("PIN must be exactly 4 digits")
+    return v
 
 
 class AccountBase(BaseModel):
@@ -14,6 +22,12 @@ class AccountBase(BaseModel):
     credit_balance: Decimal = Decimal("0")
     credit_limit: Decimal = Decimal("0")
     credit_score: int | None = Field(default=None, ge=300, le=900)
+    pin: str | None = None
+
+    @field_validator("pin", mode="before")
+    @classmethod
+    def validate_pin(cls, v: str | None) -> str | None:
+        return _validate_pin(v)
 
 
 class AccountCreate(AccountBase):
@@ -30,12 +44,28 @@ class AccountUpdate(BaseModel):
     credit_balance: Decimal | None = None
     credit_limit: Decimal | None = None
     credit_score: int | None = Field(default=None, ge=300, le=900)
+    pin: str | None = None
+
+    @field_validator("pin", mode="before")
+    @classmethod
+    def validate_pin(cls, v: str | None) -> str | None:
+        return _validate_pin(v)
 
 
-class Account(AccountBase):
+class Account(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     user_id: str
+    first_name: str
+    last_name: str
+    address: str | None = None
+    date_of_birth: date | None = None
+    chequing_balance: Decimal = Decimal("0")
+    savings_balance: Decimal = Decimal("0")
+    credit_balance: Decimal = Decimal("0")
+    credit_limit: Decimal = Decimal("0")
+    credit_score: int | None = None
+    has_pin: bool = False          # true when a PIN is saved — never expose raw pin
     last_login_at: datetime | None = None
     last_login_loc: str | None = None
     face_image_path: str | None = None

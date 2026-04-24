@@ -1,185 +1,305 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import { useFaceApi } from "@/hooks/useFaceApi";
+/**
+ * FaceCapture — webcam component with live face-api.js detection overlay.
+ *
+ * face-api.js runs in the browser and draws a bounding box so the user can
+ * see their face is detected before capturing.  All actual face embedding /
+ * identity matching still happens server-side via DeepFace.
+ *
+ * matchOnly=false  → manual "Capture" button (account set-up flow)
+ * matchOnly=true   → auto-captures every 2.5 s and fires onCapture (lobby)
+ * minimal=true     → no visible UI, just runs the capture loop in background
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export type CaptureResult = {
-  descriptor: number[];   // 128-dim face-api.js descriptor
-  imageDataUrl: string;   // JPEG snapshot for storage
+  imageDataUrl: string; // data:image/jpeg;base64,…
 };
 
 type Props = {
   onCapture: (result: CaptureResult) => void;
   onError?: (msg: string) => void;
-  /** Match-only mode: pass this to identify a face (no capture saved) */
   matchOnly?: boolean;
+  minimal?: boolean;
 };
 
-export function FaceCapture({ onCapture, onError, matchOnly = false }: Props) {
-  const faceState = useFaceApi();
+// ── face-api.js model loading (lazy, once per page load) ─────────────────────
+let faceApiLoaded = false;
+let faceApiLoading = false;
+
+async function loadFaceApi() {
+  if (faceApiLoaded || faceApiLoading) return;
+  faceApiLoading = true;
+  try {
+    const faceapi = await import("face-api.js");
+    const MODEL_URL = "/models";
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+    ]);
+    faceApiLoaded = true;
+  } catch (e) {
+    console.warn("face-api.js failed to load:", e);
+  } finally {
+    faceApiLoading = false;
+  }
+}
+
+export function FaceCapture({
+  onCapture,
+  onError,
+  matchOnly = false,
+  minimal = false,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const [status, setStatus] = useState("Loading face models…");
-  const [scanning, setScanning] = useState(false);
-  const [faceDetected, setFaceDetected] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const capturedRef = useRef(false);
 
-  // Start webcam
+  const [status, setStatus] = useState("Starting camera…");
+  const [cameraReady, setCameraReady] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [modelsReady, setModelsReady] = useState(false);
+
+  // ── Load face-api.js models ─────────────────────────────────────────────────
   useEffect(() => {
-    if (faceState !== "ready") return;
-    setStatus("Starting camera…");
+    if (minimal) return; // skip overlay in minimal mode
+    loadFaceApi().then(() => {
+      if (faceApiLoaded) setModelsReady(true);
+    });
+  }, [minimal]);
+
+  // ── Start camera ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    let active = true;
     navigator.mediaDevices
       .getUserMedia({ video: { width: 640, height: 480, facingMode: "user" } })
       .then((stream) => {
+        if (!active) { stream.getTracks().forEach((t) => t.stop()); return; }
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.onloadedmetadata = () => {
             videoRef.current?.play();
-            setStatus(matchOnly ? "Look at the camera to sign in" : "Position your face in the frame");
-            setScanning(true);
+            setCameraReady(true);
+            setStatus(matchOnly ? "Looking for you…" : "Position your face in the frame");
           };
         }
       })
       .catch(() => {
+        if (!active) return;
         setStatus("Camera access denied");
-        onError?.("Camera access denied");
+        onError?.("Camera access denied. Please allow camera permission and refresh.");
       });
 
     return () => {
+      active = false;
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    };
+  }, [matchOnly, onError]);
+
+  // ── Live face detection overlay ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!cameraReady || !modelsReady || minimal) return;
+
+    const run = async () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState < 2) return;
+
+      try {
+        const faceapi = await import("face-api.js");
+        const detection = await faceapi.detectSingleFace(
+          video,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.45 })
+        );
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (detection) {
+          setFaceDetected(true);
+          if (!capturedRef.current) {
+            setStatus(matchOnly ? "Face detected — matching…" : "Face detected ✓ — click Capture");
+          }
+
+          // Mirror the bounding box (video is CSS-mirrored with scaleX(-1))
+          const { x, y, width, height } = detection.box;
+          const mirroredX = canvas.width - x - width;
+
+          // Draw glowing bounding box
+          ctx.shadowColor = "#22d3ee";
+          ctx.shadowBlur = 12;
+          ctx.strokeStyle = "#22d3ee";
+          ctx.lineWidth = 2.5;
+          ctx.strokeRect(mirroredX, y, width, height);
+
+          // Corner accents
+          const corner = Math.min(width, height) * 0.18;
+          ctx.shadowBlur = 0;
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 3;
+          const drawCorner = (cx: number, cy: number, dx: number, dy: number) => {
+            ctx.beginPath();
+            ctx.moveTo(cx + dx * corner, cy);
+            ctx.lineTo(cx, cy);
+            ctx.lineTo(cx, cy + dy * corner);
+            ctx.stroke();
+          };
+          drawCorner(mirroredX, y, 1, 1);
+          drawCorner(mirroredX + width, y, -1, 1);
+          drawCorner(mirroredX, y + height, 1, -1);
+          drawCorner(mirroredX + width, y + height, -1, -1);
+
+          // Confidence label
+          ctx.font = "11px monospace";
+          ctx.fillStyle = "#22d3ee";
+          ctx.fillText(`${Math.round(detection.score * 100)}%`, mirroredX + 4, y - 6);
+        } else {
+          setFaceDetected(false);
+          if (!capturedRef.current) {
+            setStatus(matchOnly ? "Looking for you…" : "Position your face in the frame");
+          }
+        }
+      } catch {
+        // detection errors are non-fatal — just skip the frame
+      }
+    };
+
+    detectionRef.current = setInterval(run, 180);
+    return () => {
+      if (detectionRef.current) clearInterval(detectionRef.current);
+    };
+  }, [cameraReady, modelsReady, matchOnly, minimal]);
+
+  // ── Auto-capture loop (matchOnly) ────────────────────────────────────────────
+  useEffect(() => {
+    if (!matchOnly || !cameraReady) return;
+
+    const capture = () => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) return;
+      const snap = document.createElement("canvas");
+      snap.width = video.videoWidth;
+      snap.height = video.videoHeight;
+      snap.getContext("2d")?.drawImage(video, 0, 0);
+      onCapture({ imageDataUrl: snap.toDataURL("image/jpeg", 0.85) });
+    };
+
+    const init = setTimeout(capture, 800);
+    intervalRef.current = setInterval(capture, 2500);
+
+    return () => {
+      clearTimeout(init);
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [faceState, matchOnly, onError]);
+  }, [matchOnly, cameraReady, onCapture]);
 
-  // Continuous face detection loop
-  useEffect(() => {
-    if (!scanning) return;
-
-    const detect = async () => {
-      if (!videoRef.current || videoRef.current.readyState < 2) return;
-      const faceapi = (await import("face-api.js")).default ?? await import("face-api.js");
-
-      // Use TinyFaceDetector for the live loop — 5-10× faster than SSD MobileNet.
-      // Only SSD MobileNet is used at final capture for the full descriptor.
-      const result = await faceapi
-        .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.5 }))
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-
-      if (!result) {
-        setFaceDetected(false);
-        drawOverlay(false);
-        return;
-      }
-
-      setFaceDetected(true);
-      drawOverlay(true, result.detection.box);
-    };
-
-    intervalRef.current = setInterval(detect, 150);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [scanning]);
-
-  const drawOverlay = (detected: boolean, box?: { x: number; y: number; width: number; height: number }) => {
-    const canvas = canvasRef.current;
+  // ── Manual capture ────────────────────────────────────────────────────────────
+  const captureManual = useCallback(() => {
     const video = videoRef.current;
-    if (!canvas || !video) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (detected && box) {
-      ctx.strokeStyle = "#22c55e";
-      ctx.lineWidth = 3;
-      ctx.strokeRect(box.x, box.y, box.width, box.height);
-    }
-  };
+    if (!video || capturedRef.current) return;
+    capturedRef.current = true;
 
-  const capture = useCallback(async () => {
-    if (!videoRef.current || !faceDetected) return;
-    const faceapi = (await import("face-api.js")).default ?? await import("face-api.js");
-
-    setStatus("Capturing…");
-    const result = await faceapi
-      .detectSingleFace(videoRef.current, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.7 }))
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    if (!result) {
-      setStatus("No face detected — try again");
-      return;
-    }
-
-    // Snapshot
     const snap = document.createElement("canvas");
-    snap.width = videoRef.current.videoWidth;
-    snap.height = videoRef.current.videoHeight;
-    snap.getContext("2d")?.drawImage(videoRef.current, 0, 0);
-    const imageDataUrl = snap.toDataURL("image/jpeg", 0.8);
+    snap.width = video.videoWidth;
+    snap.height = video.videoHeight;
+    snap.getContext("2d")?.drawImage(video, 0, 0);
 
     streamRef.current?.getTracks().forEach((t) => t.stop());
-    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (detectionRef.current) clearInterval(detectionRef.current);
+    const canvas = canvasRef.current;
+    if (canvas) canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
 
-    onCapture({
-      descriptor: Array.from(result.descriptor),
-      imageDataUrl,
-    });
-  }, [faceDetected, onCapture]);
+    setStatus("Captured ✓");
+    onCapture({ imageDataUrl: snap.toDataURL("image/jpeg", 0.9) });
+  }, [onCapture]);
 
-  // Auto-capture in match-only mode when face is confidently detected
-  useEffect(() => {
-    if (matchOnly && faceDetected) {
-      capture();
-    }
-  }, [matchOnly, faceDetected, capture]);
-
-  if (faceState === "error") {
-    return <p className="text-red-600 text-sm">Failed to load face models.</p>;
-  }
-
-  if (faceState === "loading") {
+  // ── Minimal mode ──────────────────────────────────────────────────────────────
+  if (minimal) {
     return (
-      <div className="flex flex-col items-center gap-3 py-6">
-        <div className="w-8 h-8 border-2 border-neutral-300 border-t-neutral-800 rounded-full animate-spin" />
-        <p className="text-sm text-neutral-500">Loading face recognition models…</p>
-        <p className="text-xs text-neutral-400">(first load only — ~3 seconds)</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col items-center gap-3">
-      <div className="relative rounded-xl overflow-hidden border-2 border-neutral-200 bg-black" style={{ width: 320, height: 240 }}>
+      <div className="flex items-center gap-2">
         <video
           ref={videoRef}
           muted
           playsInline
-          className="w-full h-full object-cover"
+          className="absolute h-px w-px opacity-0 pointer-events-none"
+        />
+        <span
+          className={[
+            "h-2 w-2 rounded-full",
+            cameraReady ? "bg-green-400 animate-pulse" : "bg-slate-500",
+          ].join(" ")}
+        />
+        <span className="text-xs text-white/60">{status}</span>
+      </div>
+    );
+  }
+
+  // ── Full UI ───────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col items-center gap-4">
+      {/* Camera frame */}
+      <div
+        className="relative overflow-hidden rounded-2xl border-2 bg-black shadow-lg transition-colors duration-300"
+        style={{
+          width: 320,
+          height: 240,
+          borderColor: faceDetected ? "#22d3ee" : "#e5e7eb",
+          boxShadow: faceDetected ? "0 0 18px rgba(34,211,238,0.35)" : undefined,
+        }}
+      >
+        {/* Mirrored video feed */}
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          className="h-full w-full object-cover"
           style={{ transform: "scaleX(-1)" }}
         />
+
+        {/* face-api.js detection overlay canvas (NOT mirrored — we mirror the box coords in JS) */}
         <canvas
           ref={canvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
-          style={{ transform: "scaleX(-1)" }}
+          width={640}
+          height={480}
+          className="pointer-events-none absolute inset-0 h-full w-full"
         />
-        {faceDetected && (
-          <span className="absolute top-2 left-2 bg-green-500 text-white text-xs px-2 py-0.5 rounded-full">
-            Face detected ✓
-          </span>
+
+        {/* Loading overlay */}
+        {!cameraReady && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80 text-white">
+            <span className="h-6 w-6 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+            <span className="text-xs">{status}</span>
+          </div>
         )}
       </div>
-      <p className="text-sm text-neutral-600">{status}</p>
+
+      {/* Status */}
+      <p className={`text-sm transition-colors ${faceDetected ? "text-cyan-500 font-medium" : "text-neutral-500"}`}>
+        {status}
+      </p>
+
+      {/* Capture button */}
       {!matchOnly && (
         <button
-          onClick={capture}
-          disabled={!faceDetected}
-          className="rounded bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-700 disabled:opacity-40"
+          onClick={captureManual}
+          disabled={!cameraReady || status === "Captured ✓" || (!faceDetected && modelsReady)}
+          className="rounded-lg bg-neutral-900 px-6 py-2.5 text-sm font-medium text-white transition hover:bg-neutral-700 disabled:opacity-40"
+          title={!faceDetected && modelsReady ? "No face detected — look directly at the camera" : undefined}
         >
-          {faceDetected ? "Capture face" : "Waiting for face…"}
+          {status === "Captured ✓" ? "✓ Face saved" : "Capture face"}
         </button>
+      )}
+
+      {/* Hint when face not detected */}
+      {cameraReady && modelsReady && !faceDetected && status !== "Captured ✓" && (
+        <p className="text-xs text-neutral-400">No face detected — look directly at the camera</p>
       )}
     </div>
   );
