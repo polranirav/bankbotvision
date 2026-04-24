@@ -49,6 +49,12 @@ export default function AccountPage() {
   const [faceBusy, setFaceBusy] = useState(false);
   const [faceMsg, setFaceMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
+  // PIN panel state
+  const [pinPanel, setPinPanel] = useState(false);
+  const [pinValue, setPinValue] = useState("");
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinMsg, setPinMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
   useEffect(() => {
     (async () => {
       const { data } = await supabase.auth.getSession();
@@ -68,10 +74,33 @@ export default function AccountPage() {
     })();
   }, [router]);
 
-  async function handleUpdate(values: Parameters<typeof AccountForm>[0]["initial"]) {
+  async function handleUpdate(values: Record<string, unknown>) {
     const updated = await api<Account>("/accounts/me", { method: "PUT", body: JSON.stringify(values) });
     setAccount(updated);
     setEditing(false);
+  }
+
+  async function handlePinSave() {
+    if (pinValue.length !== 4 || !/^\d{4}$/.test(pinValue)) {
+      setPinMsg({ type: "err", text: "PIN must be exactly 4 digits." });
+      return;
+    }
+    setPinBusy(true);
+    setPinMsg(null);
+    try {
+      const updated = await api<Account>("/accounts/me", {
+        method: "PUT",
+        body: JSON.stringify({ pin: pinValue }),
+      });
+      setAccount(updated);
+      setPinMsg({ type: "ok", text: "PIN saved successfully." });
+      setPinValue("");
+      setPinPanel(false);
+    } catch (e) {
+      setPinMsg({ type: "err", text: e instanceof Error ? e.message : "Could not save PIN." });
+    } finally {
+      setPinBusy(false);
+    }
   }
 
   // ── Face ID: register / update ──────────────────────────────────────────
@@ -271,6 +300,68 @@ export default function AccountPage() {
               <button
                 onClick={() => setFacePanel("closed")}
                 className="rounded border border-neutral-200 px-4 py-2 text-sm hover:bg-neutral-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── Robot PIN card ── */}
+      <div className="rounded-xl border border-neutral-200 p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`flex h-10 w-10 items-center justify-center rounded-full text-xl ${account.has_pin ? "bg-green-50" : "bg-neutral-100"}`}>
+              {account.has_pin ? "🔐" : "🔓"}
+            </div>
+            <div>
+              <p className="text-sm font-semibold">Robot PIN</p>
+              <p className="text-xs text-neutral-500">
+                {account.has_pin
+                  ? "PIN is set — say it when the robot asks to access your account"
+                  : "No PIN set — you won't be able to access account details via the robot"}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => { setPinPanel(!pinPanel); setPinMsg(null); setPinValue(""); }}
+            className="rounded border border-neutral-200 px-3 py-1.5 text-xs hover:bg-neutral-50"
+          >
+            {account.has_pin ? "Change PIN" : "Set PIN"}
+          </button>
+        </div>
+
+        {pinMsg && (
+          <p className={`text-sm ${pinMsg.type === "ok" ? "text-green-600" : "text-red-500"}`}>
+            {pinMsg.text}
+          </p>
+        )}
+
+        {pinPanel && (
+          <div className="border-t border-neutral-100 pt-4 space-y-3">
+            <p className="text-sm text-neutral-600">Enter a 4-digit PIN. You will say this to the robot to verify your identity.</p>
+            <div className="flex items-center gap-3">
+              <input
+                type="password"
+                inputMode="numeric"
+                pattern="[0-9]{4}"
+                maxLength={4}
+                placeholder="••••"
+                value={pinValue}
+                onChange={(e) => setPinValue(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                className="w-24 rounded border border-neutral-300 px-3 py-2 text-center text-lg tracking-widest"
+              />
+              <button
+                onClick={handlePinSave}
+                disabled={pinBusy || pinValue.length !== 4}
+                className="rounded bg-neutral-900 px-4 py-2 text-sm text-white hover:bg-neutral-700 disabled:opacity-40"
+              >
+                {pinBusy ? "Saving…" : "Save PIN"}
+              </button>
+              <button
+                onClick={() => { setPinPanel(false); setPinValue(""); setPinMsg(null); }}
+                className="text-xs text-neutral-400 hover:text-neutral-600"
               >
                 Cancel
               </button>

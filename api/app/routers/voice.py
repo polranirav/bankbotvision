@@ -87,11 +87,13 @@ def _transcribe_local(audio_bytes: bytes, extension: str) -> str:
     try:
         segments, info = model.transcribe(
             tmp_path,
-            beam_size=1,           # greedy decoding — 3-4x faster, minimal accuracy loss
+            beam_size=3,           # lower = faster, slightly less accurate
             language="en",         # constrain to English for speed
             vad_filter=True,       # skip silence segments
             vad_parameters=dict(
-                min_silence_duration_ms=400,
+                min_silence_duration_ms=500,
+                speech_pad_ms=200,
+                threshold=0.4
             ),
         )
         # Collect all segments into final text

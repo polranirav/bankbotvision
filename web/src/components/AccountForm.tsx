@@ -3,14 +3,16 @@
 import { useState } from "react";
 import type { AccountCreate } from "@/types/account";
 
+type FormValues = Omit<AccountCreate, "pin">;
+
 type Props = {
-  initial?: Partial<AccountCreate>;
+  initial?: Partial<FormValues>;
   submitLabel?: string;
-  onSubmit: (values: AccountCreate) => Promise<void>;
+  onSubmit: (values: FormValues) => Promise<void>;
 };
 
 export function AccountForm({ initial = {}, submitLabel = "Save", onSubmit }: Props) {
-  const [values, setValues] = useState<AccountCreate>({
+  const [values, setValues] = useState<FormValues>({
     first_name: initial.first_name ?? "",
     last_name: initial.last_name ?? "",
     address: initial.address ?? "",
@@ -24,7 +26,7 @@ export function AccountForm({ initial = {}, submitLabel = "Save", onSubmit }: Pr
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  function set<K extends keyof AccountCreate>(key: K, v: AccountCreate[K]) {
+  function set<K extends keyof FormValues>(key: K, v: FormValues[K]) {
     setValues((prev) => ({ ...prev, [key]: v }));
   }
 
@@ -33,7 +35,7 @@ export function AccountForm({ initial = {}, submitLabel = "Save", onSubmit }: Pr
     setBusy(true);
     setError(null);
     try {
-      await onSubmit(values);
+      await onSubmit({ ...values });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

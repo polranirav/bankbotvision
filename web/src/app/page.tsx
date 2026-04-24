@@ -57,6 +57,7 @@ type FrontDeskReply = {
   escalate?: boolean;
   clarification_count?: number;
   intent_module?: string;
+  pin_verified?: boolean;
 };
 
 export default function Home() {
@@ -75,6 +76,15 @@ export default function Home() {
   const isSpeakingRef = useRef(false);
   const [vadLevel, setVadLevel] = useState(0); // 0–100, for waveform indicator
 
+  // ── Auth state refs — always current even inside stale VAD closures ──────────
+  const identityStateRef = useRef<IdentityState>("unknown");
+  const cameraStateRef   = useRef<CameraState>("waiting");
+  const pinVerifiedRef   = useRef(false);
+  const userIdRef        = useRef<string | null>(null);
+  const recognisedNameRef= useRef<string | null>(null);
+  const pendingQueryRef  = useRef<string | null>(null);
+  const pendingMagicLinkRef = useRef<string | null>(null);
+
   const [authFirstName, setAuthFirstName] = useState<string | null>(null);
   const [selectedRobot, setSelectedRobot] = useState<RobotDef | null>(null);
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
@@ -86,6 +96,10 @@ export default function Home() {
   const [speechSupported, setSpeechSupported] = useState(true);
   const [recognisedName, setRecognisedName] = useState<string | null>(null);
   const [identityState, setIdentityState] = useState<IdentityState>("unknown");
+  const [userId, setUserId] = useState<string | null>(null);
+  const [pinVerified, setPinVerified] = useState(false);
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null);
+  const [lastTurn, setLastTurn] = useState<{ said: string; understood: string; reply: string } | null>(null);
   const [pendingMagicLink, setPendingMagicLink] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionError, setSessionError] = useState("");
@@ -95,9 +109,14 @@ export default function Home() {
     "Click an available desk and the agent will greet you.",
   );
 
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  useEffect(() => { messagesRef.current       = messages;       }, [messages]);
+  useEffect(() => { identityStateRef.current  = identityState;  }, [identityState]);
+  useEffect(() => { cameraStateRef.current    = cameraState;    }, [cameraState]);
+  useEffect(() => { pinVerifiedRef.current    = pinVerified;    }, [pinVerified]);
+  useEffect(() => { userIdRef.current         = userId;         }, [userId]);
+  useEffect(() => { recognisedNameRef.current = recognisedName; }, [recognisedName]);
+  useEffect(() => { pendingQueryRef.current   = pendingQuery;   }, [pendingQuery]);
+  useEffect(() => { pendingMagicLinkRef.current = pendingMagicLink; }, [pendingMagicLink]);
 
   useEffect(() => {
     setSpeechSupported(typeof window !== "undefined" && "MediaRecorder" in window);
@@ -146,15 +165,6 @@ export default function Home() {
     return () => listener.subscription.unsubscribe();
   }, []);
 
-  const deskStates = useMemo(
-    () =>
-      ROBOTS.map((robot) => ({
-        robot,
-        label: "Open",
-      })),
-    [],
-  );
-
   function pushMessage(role: ChatMessage["role"], text: string) {
     setMessages((current) => [
       ...current,
@@ -166,10 +176,10 @@ export default function Home() {
     if (!action) return;
 
     if (action.autoListen) {
-      // Always auto-listen after robot speaks — VAD handles stop automatically
+      // Wait 600 ms after TTS ends before listening
       speechTimeoutRef.current = setTimeout(() => {
         void startVADListen();
-      }, 500);
+      }, 600);
       return;
     }
 
@@ -243,6 +253,31 @@ export default function Home() {
     window.speechSynthesis.speak(utterance);
   }
 
+  // Speak a short immediate acknowledgment without adding it to the message log.
+  // The real speakAgent call (with the API reply) will cancel this naturally.
+  function speakQuick(text: string) {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const gen = ++speechGenRef.current;
+    isSpeakingRef.current = true;
+    setIsRobotSpeaking(true);
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    utterance.pitch = selectedRobot?.name === "ZED" ? 0.9 : 1.03;
+    utterance.onend = () => {
+      if (speechGenRef.current !== gen) return;
+      isSpeakingRef.current = false;
+      setIsRobotSpeaking(false);
+    };
+    utterance.onerror = (e) => {
+      if ((e as SpeechSynthesisErrorEvent).error === "canceled") return;
+      if (speechGenRef.current !== gen) return;
+      isSpeakingRef.current = false;
+      setIsRobotSpeaking(false);
+    };
+    window.speechSynthesis.speak(utterance);
+  }
+
   async function requestMicrophone() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -264,6 +299,9 @@ export default function Home() {
     setSessionStage("permissions");
     setCameraState("waiting");
     setRecognisedName(null);
+    setUserId(null);
+    setPinVerified(false);
+    setPendingQuery(null);
     setIdentityState("unknown");
     setPendingMagicLink(null);
     setMessages([]);
@@ -273,9 +311,14 @@ export default function Home() {
     autoListenEnabledRef.current = true;
 
     // Speak FIRST — must happen synchronously within the click gesture to unlock
-    // the Web Speech API. Face scan will interrupt this with the real greeting.
+    // the Web Speech API. Keep it short so the VAD doesn't echo-loop on it.
+    const greetings = [
+      "Hi there! How can I help you today?",
+      "Hello! Good to see you. What can I do for you?",
+      "Hey, welcome in! How are you doing today?",
+    ];
     speakAgent(
-      `Hi, one moment.`,
+      greetings[Math.floor(Math.random() * greetings.length)],
       { autoListen: true },
     );
 
@@ -313,6 +356,10 @@ export default function Home() {
     setSessionStage("idle");
     setCameraState("waiting");
     setRecognisedName(null);
+    setUserId(null);
+    setPinVerified(false);
+    setIdentityState("unknown");
+    setPendingQuery(null);
     setPendingMagicLink(null);
     setMessages([]);
     setSessionError("");
@@ -322,8 +369,8 @@ export default function Home() {
 
   async function handleFaceCapture(result: CaptureResult) {
     if (!selectedRobot) return;
-    // If we've already matched or errored, stop processing new frames
-    if (cameraState === "matched" || cameraState === "error" || cameraState === "new") return;
+    // Stop processing once we have a result (matched/new) or hardware error
+    if (cameraState === "matched" || cameraState === "new" || cameraState === "error") return;
 
     const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
@@ -354,85 +401,71 @@ export default function Home() {
         setSessionStage("ready");
         setIdentityState("guest");
         speakAgent(
-          "I don't see you in our system yet — looks like you might be new here. What can I help you with today?",
+          "Welcome! I can help with balances, recent spending, account questions, and opening a new account. What would you like to do?",
           { autoListen: true },
         );
         return;
       }
 
       setRecognisedName(data.first_name);
-      setIdentityState("confirming");
+      setUserId(data.user_id);
+      setIdentityState("confirmed");
       setPendingMagicLink(data.magic_link);
       setCameraState("matched");
       setSessionStage("ready");
       speakAgent(
-        `I think I recognise you — are you ${data.first_name}? Just confirm your name and I'll pull up your account.`,
+        `Welcome back, ${data.first_name}! Please say your four-digit PIN one digit at a time.`,
         { autoListen: true },
       );
-    } catch (error) {
-      setCameraState("error");
-      setSessionStage("ready");
-      setIdentityState("guest");
-      setSessionError(error instanceof Error ? error.message : "Face recognition is unavailable right now.");
-      speakAgent(
-        "Face scan had a little trouble, but no worries — I can still help. What's your name and what brings you in today?",
-        { autoListen: true },
-      );
+    } catch {
+      // Silently skip this frame — let the next capture interval retry.
+      // Do NOT change cameraState here; setting it to "new" would block all future frames.
     }
   }
 
-  function handleFaceError(message: string) {
+  function handleFaceError(_msg?: string) {
+    // Camera hardware unavailable — fall back to guest without blocking future frames
     setCameraState("error");
     setSessionStage("ready");
     setIdentityState("guest");
-    setSessionError(message);
-    speakAgent(
-      "I'm having trouble with the camera, but that's okay. Tell me your name and what I can help you with.",
-      { autoListen: true },
-    );
   }
 
   async function processVisitorRequest(text: string) {
     if (!selectedRobot) return;
 
-    // Once the visitor starts talking, stop face scanning — we don't want
-    // a late scan result interrupting an ongoing conversation.
-    setCameraState((s) => (s === "waiting" || s === "matching" ? "new" : s));
-    setIdentityState((id) => (id === "unknown" ? "guest" : id));
-
     const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
-    const encodedAgent = encodeURIComponent(selectedRobot.name);
     const lowerText = text.toLowerCase();
 
-    if (identityState === "confirming" && recognisedName) {
-      const recognisedLower = recognisedName.toLowerCase();
-      const mentionsRecognisedName = lowerText.includes(recognisedLower);
-      const providedAnyName =
-        /\bmy name is\b/.test(lowerText) ||
-        /\bi am\b/.test(lowerText) ||
-        /\bit's\b/.test(lowerText) ||
-        text.trim().split(/\s+/).length <= 3;
+    // ── Phase 1: Face still scanning ─────────────────────────────────────────
+    // Read auth state from refs — always current even inside stale VAD closures
+    const currentIdentity  = identityStateRef.current;
+    const currentCamera    = cameraStateRef.current;
+    const currentPinVerified = pinVerifiedRef.current;
+    const currentUserId    = userIdRef.current;
+    const currentName      = recognisedNameRef.current;
+    const currentPending   = pendingQueryRef.current;
+    const currentMagicLink = pendingMagicLinkRef.current;
 
-      if (mentionsRecognisedName) {
-        setIdentityState("confirmed");
-        setSessionStage("ready");
-        speakAgent(
-          `Great to see you, ${recognisedName}! What can I help you with today?`,
-          { autoListen: micGranted && speechSupported },
-        );
-        return;
-      }
+    // ── Phase 1: Face still scanning ─────────────────────────────────────────
+    const stillScanning = currentCamera === "waiting" || currentCamera === "matching";
+    if (stillScanning) {
+      const isSmallTalk = /^(hi|hello|hey|good|fine|great|thanks?|how are|i'?m\b)/i.test(text.trim());
+      if (!isSmallTalk) setPendingQuery(text);
+      setCameraState("new");
+      setIdentityState("guest");
+    }
 
-      if (providedAnyName) {
-        setIdentityState("confirmed");
-        setSessionStage("ready");
-        speakAgent(
-          `Thanks for that. What can I help you with today?`,
-          { autoListen: micGranted && speechSupported },
-        );
+    // ── Phase 2: PIN entry — intercept before calling backend ─────────────────
+    if (currentIdentity === "confirmed" && !currentPinVerified) {
+      const hasAnyNumericContent = /\d/.test(text) ||
+        /\b(zero|one|two|three|four|five|six|seven|eight|nine|oh|ten|eleven|twelve|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\b/i.test(text);
+      if (!hasAnyNumericContent) {
+        speakAgent("Please say your four-digit PIN, one digit at a time.", { autoListen: true });
         return;
       }
     }
+
+    setLastTurn({ said: text.slice(0, 72), understood: "…", reply: "…" });
 
     try {
       const res = await fetch(`${apiUrl}/agent/frontdesk`, {
@@ -441,18 +474,20 @@ export default function Home() {
         body: JSON.stringify({
           utterance: text,
           robot_name: selectedRobot.name,
-          recognised_name: recognisedName,
-          has_face_match: cameraState === "matched",
-          has_magic_link: Boolean(pendingMagicLink),
+          recognised_name: currentName,
+          user_id: currentUserId,
+          has_face_match: currentCamera === "matched",
+          has_magic_link: Boolean(currentMagicLink),
+          pin_verified: currentPinVerified,
+          pending_query: currentPending,
           history: messagesRef.current
             .slice(-8)
             .map((message) => ({ role: message.role, text: message.text })),
-          // Session state — backend uses these for intent routing + auth gating
           clarification_count: clarificationCount,
-          auth_state: identityState === "confirmed" ? "confirmed"
-            : cameraState === "matched" ? "face_matched" : "none",
-          customer_type: cameraState === "new" ? "new"
-            : cameraState === "matched" ? "existing" : "unknown",
+          auth_state: currentIdentity === "confirmed" ? "confirmed"
+            : currentCamera === "matched" ? "face_matched" : "none",
+          customer_type: currentCamera === "new" ? "new"
+            : currentCamera === "matched" ? "existing" : "unknown",
         }),
       });
 
@@ -462,20 +497,46 @@ export default function Home() {
 
       const decision: FrontDeskReply = await res.json();
       setSessionStage("ready");
-      if (identityState !== "confirmed") {
-        setIdentityState(cameraState === "matched" ? "confirmed" : identityState);
+      if (currentIdentity !== "confirmed") {
+        setIdentityState(currentCamera === "matched" ? "confirmed" : currentIdentity);
       }
 
       // Echo session state back to backend on next turn
       if (typeof decision.clarification_count === "number") {
         setClarificationCount(decision.clarification_count);
       }
+      if (decision.pin_verified) {
+        setPinVerified(true);
+        setPendingQuery(null); // fulfilled — the backend already answered it
+      }
+
+      // Update transcript panel
+      const INTENT_LABELS: Record<string, string> = {
+        transfer_money: "Money transfer",
+        account_overview: "Account overview",
+        recent_transactions: "Recent transactions",
+        card_services: "Card services",
+        fraud_dispute: "Fraud dispute",
+        new_account_opening: "Opening new account",
+        product_recommendation: "Product question",
+        login_access_help: "Login help",
+        branch_appointment: "Branch / appointment",
+        greeting: "Greeting",
+        public_info: "General banking info",
+        unknown: "Clarifying request",
+        general: "General question",
+      };
+      setLastTurn({
+        said: text.length > 72 ? text.slice(0, 69) + "…" : text,
+        understood: INTENT_LABELS[decision.intent_module ?? ""] ?? decision.intent_module ?? "General",
+        reply: decision.reply.split(/(?<=[.!?])\s/)[0] ?? decision.reply,
+      });
 
       const action: AgentAction = {};
       if (decision.should_route && decision.route_target === "magic_link" && pendingMagicLink) {
         action.magicLink = pendingMagicLink;
       } else {
-        action.autoListen = micGranted && speechSupported;
+        action.autoListen = true;
       }
 
       speakAgent(decision.reply, action);
@@ -484,7 +545,7 @@ export default function Home() {
       setSessionError(error instanceof Error ? error.message : "I couldn't process that request clearly.");
       speakAgent(
         "Sorry, I didn't quite catch that. What did you need?",
-        { autoListen: micGranted && speechSupported },
+        { autoListen: true },
       );
     }
   }
@@ -521,12 +582,12 @@ export default function Home() {
       audioCtx.createMediaStreamSource(stream).connect(analyser);
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-      // Calibrate ambient noise over 400 ms
-      await new Promise(r => setTimeout(r, 400));
+      // Calibrate ambient noise over 300 ms for a stable baseline
+      await new Promise(r => setTimeout(r, 300));
       if (!autoListenEnabledRef.current) { stream.getTracks().forEach(t => t.stop()); audioCtx.close(); return; }
       analyser.getByteFrequencyData(dataArray);
       const ambient = dataArray.slice(0, 32).reduce((a, b) => a + b, 0) / 32;
-      const SPEECH_THRESH = Math.max(14, ambient * 2.8);
+      const SPEECH_THRESH = Math.max(20, ambient * 3.2);
 
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus" : "audio/webm";
@@ -535,8 +596,12 @@ export default function Home() {
       recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
 
       let hasSpeech = false;
+      let speechFrames = 0;          // consecutive frames above threshold
+      const SPEECH_FRAMES_MIN = 4;   // 4 × 80 ms = 320 ms continuous speech required
       let silenceStart = Date.now();
       const recordStart = Date.now();
+      // Deaf window: ignore speech for first 300 ms after VAD starts
+      const deafUntil = Date.now() + 300;
 
       recorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
@@ -546,7 +611,7 @@ export default function Home() {
 
         const blob = new Blob(audioChunksRef.current, { type: mimeType });
         // Too short or no real speech — restart listener
-        if (!hasSpeech || blob.size < 800) {
+        if (!hasSpeech || blob.size < 3000) {
           if (autoListenEnabledRef.current) setTimeout(() => startVADListen(), 400);
           return;
         }
@@ -589,20 +654,26 @@ export default function Home() {
         );
         setVadLevel(level);
 
-        const speaking = level * 2.55 > SPEECH_THRESH;
+        const speaking = level * 2.55 > SPEECH_THRESH && Date.now() > deafUntil;
         if (speaking) {
-          hasSpeech = true;
-          silenceStart = Date.now();
+          speechFrames++;
+          if (speechFrames >= SPEECH_FRAMES_MIN) {
+            // Only count as real speech after 320 ms continuous — filters noise bursts
+            hasSpeech = true;
+            silenceStart = Date.now();
+          }
+        } else {
+          speechFrames = 0; // reset on any quiet frame
         }
 
         const silenceDuration = Date.now() - silenceStart;
         const elapsed = Date.now() - recordStart;
 
-        // Stop conditions: silence after speech (900ms) OR no speech in 9s
-        if (hasSpeech && silenceDuration > 900) {
+        // Stop conditions: silence after speech (700ms) OR no speech in 7s
+        if (hasSpeech && silenceDuration > 700) {
           if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
           if (recorder.state === "recording") recorder.stop();
-        } else if (!hasSpeech && elapsed > 9000) {
+        } else if (!hasSpeech && elapsed > 7000) {
           if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
           if (recorder.state === "recording") recorder.stop();
         }
@@ -622,6 +693,15 @@ export default function Home() {
     if (sessionStage === "processing") return `${selectedRobot.name} is responding`;
     return `${selectedRobot.name} at your desk`;
   }, [cameraState, recognisedName, selectedRobot, sessionStage]);
+
+  const microcopy = useMemo(() => {
+    if (cameraState === "waiting") return "Camera active · looking for you";
+    if (cameraState === "matching") return "Checking your identity";
+    if (identityState === "confirming") return "Please confirm your name";
+    if (sessionStage === "processing") return "Fetching your details";
+    if (sessionStage === "listening") return "Listening — speak naturally";
+    return "";
+  }, [cameraState, identityState, sessionStage]);
 
   return (
     <div className="min-h-screen bg-[#eaf1f7] text-slate-950">
@@ -687,57 +767,286 @@ export default function Home() {
         </div>
       </header>
 
-      <main className="relative h-[calc(100vh-37px)] min-h-[760px] overflow-hidden bg-[radial-gradient(circle_at_top,#1e3a8a_0%,#0f172a_38%,#020617_100%)]">
+      <main
+        className="relative h-[calc(100vh-37px)] min-h-[760px] overflow-hidden"
+        style={{ background: "radial-gradient(ellipse 100% 75% at 50% 15%, #0d0321 0%, #04010e 55%, #020109 100%)" }}
+      >
+        {/* ── 3-D robot scene ── */}
         <div className="absolute inset-0">
           <RobotScene
-            onSelectRobot={handleSelectRobot}
-            focusIndex={focusIndex}
-            speakingIndex={isRobotSpeaking ? focusIndex : null}
-            listeningIndex={sessionStage === "listening" ? focusIndex : null}
+            onSelectRobot={(robot) => handleSelectRobot(robot, 0)}
+            focused={sessionOpen && focusIndex !== null}
+            speaking={isRobotSpeaking}
+            listening={sessionStage === "listening"}
           />
         </div>
 
-        <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-slate-950/75 via-slate-950/35 to-transparent" />
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-56 bg-gradient-to-t from-slate-950 via-slate-950/65 to-transparent" />
+        {/* ══════════════════════════════════════════════════════════
+            CYBERPUNK LOBBY ATMOSPHERE
+            ══════════════════════════════════════════════════════════ */}
 
-        {/* ── Desk name plates on the counter ── */}
+        {/* 1 · Scanline texture — barely-there CRT feel */}
         <div
-          className={[
-            "pointer-events-none absolute inset-x-0 z-10 flex justify-around px-[8%] transition-opacity duration-500",
-            focusIndex === null ? "opacity-100" : "opacity-0",
-          ].join(" ")}
-          style={{ bottom: "29%" }}
-        >
-          {ROBOTS.map((robot) => (
-            <div key={robot.name} className="flex flex-col items-center gap-1">
-              {/* Name plate */}
+          className="pointer-events-none absolute inset-0 z-[1]"
+          style={{ backgroundImage: "repeating-linear-gradient(0deg, transparent 0px, transparent 2px, rgba(0,229,255,0.018) 2px, rgba(0,229,255,0.018) 3px)" }}
+        />
+
+        {/* 2 · Deep purple radial glow behind robot */}
+        <div
+          className="pointer-events-none absolute inset-0 z-[1]"
+          style={{ background: "radial-gradient(ellipse 75% 55% at 50% 38%, #1a0a3840 0%, transparent 70%)" }}
+        />
+
+        {/* 3 · Horizon glow halo */}
+        <div
+          className="pointer-events-none absolute inset-x-0 z-[2]"
+          style={{
+            top: "55%",
+            height: "90px",
+            background: "linear-gradient(to bottom, transparent, #00e5ff10 30%, #00e5ff1a 50%, #bf00ff0a 70%, transparent)",
+            animation: "horizon-breathe 5s ease-in-out infinite",
+          }}
+        />
+
+        {/* 4 · Horizon line — cyan → magenta */}
+        <div
+          className="pointer-events-none absolute inset-x-0 z-[2]"
+          style={{
+            top: "57%",
+            height: "1px",
+            background: "linear-gradient(to right, transparent 0%, #00e5ff55 12%, #00e5ff 30%, #00e5ffcc 45%, #bf00ffcc 55%, #bf00ff 70%, #bf00ff55 88%, transparent 100%)",
+            boxShadow: "0 0 10px 3px rgba(0,229,255,0.35), 0 0 22px 8px rgba(0,229,255,0.12)",
+            animation: "horizon-breathe 5s ease-in-out infinite",
+          }}
+        />
+
+        {/* 5 · Perspective grid floor */}
+        <div
+          className="pointer-events-none absolute z-[2]"
+          style={{
+            bottom: 0,
+            left: "-35%",
+            right: "-35%",
+            height: "44%",
+            backgroundImage: [
+              "repeating-linear-gradient(90deg, rgba(0,229,255,0.22) 0px, transparent 1px, transparent 79px, rgba(0,229,255,0.22) 80px)",
+              "repeating-linear-gradient(0deg, rgba(0,229,255,0.22) 0px, transparent 1px, transparent 59px, rgba(0,229,255,0.22) 60px)",
+              "linear-gradient(to top, rgba(0,229,255,0.1) 0%, rgba(191,0,255,0.04) 50%, transparent 80%)",
+            ].join(","),
+            transform: "perspective(340px) rotateX(73deg)",
+            transformOrigin: "top center",
+            animation: "grid-pulse 6s ease-in-out infinite",
+          }}
+        />
+
+        {/* 6 · Floor center glow — robot standing point */}
+        <div
+          className="pointer-events-none absolute bottom-0 left-1/2 z-[3] -translate-x-1/2"
+          style={{
+            width: "560px",
+            height: "160px",
+            background: "radial-gradient(ellipse at bottom, #00e5ff28 0%, #bf00ff12 45%, transparent 72%)",
+            animation: "horizon-breathe 4s ease-in-out infinite 1.2s",
+          }}
+        />
+
+        {/* 7 · Left primary neon column */}
+        <div
+          className="pointer-events-none absolute z-[3]"
+          style={{
+            top: "7%", bottom: "14%", left: "6%", width: "2px",
+            background: "linear-gradient(to bottom, transparent 0%, #00e5ff 12%, #00e5ff 82%, #bf00ff 96%, transparent 100%)",
+            boxShadow: "0 0 8px 2px rgba(0,229,255,0.65), 0 0 22px 6px rgba(0,229,255,0.2)",
+            animation: "neon-flicker 7s ease-in-out infinite",
+          }}
+        />
+        <div
+          className="pointer-events-none absolute z-[2]"
+          style={{
+            top: "7%", bottom: "14%", left: "calc(6% - 18px)", width: "40px",
+            background: "linear-gradient(to right, transparent, rgba(0,229,255,0.07) 50%, transparent)",
+          }}
+        />
+
+        {/* 8 · Left secondary neon column */}
+        <div
+          className="pointer-events-none absolute z-[3]"
+          style={{
+            top: "14%", bottom: "20%", left: "18%", width: "1px",
+            background: "linear-gradient(to bottom, transparent 0%, #bf00ff90 20%, #bf00ff90 75%, transparent 100%)",
+            boxShadow: "0 0 6px 2px rgba(191,0,255,0.45), 0 0 14px 5px rgba(191,0,255,0.15)",
+            animation: "neon-flicker-b 9s ease-in-out infinite 2s",
+          }}
+        />
+
+        {/* 9 · Right primary neon column */}
+        <div
+          className="pointer-events-none absolute z-[3]"
+          style={{
+            top: "7%", bottom: "14%", right: "6%", width: "2px",
+            background: "linear-gradient(to bottom, transparent 0%, #00e5ff 12%, #00e5ff 82%, #bf00ff 96%, transparent 100%)",
+            boxShadow: "0 0 8px 2px rgba(0,229,255,0.65), 0 0 22px 6px rgba(0,229,255,0.2)",
+            animation: "neon-flicker 7s ease-in-out infinite 1s",
+          }}
+        />
+        <div
+          className="pointer-events-none absolute z-[2]"
+          style={{
+            top: "7%", bottom: "14%", right: "calc(6% - 18px)", width: "40px",
+            background: "linear-gradient(to left, transparent, rgba(0,229,255,0.07) 50%, transparent)",
+          }}
+        />
+
+        {/* 10 · Right secondary neon column */}
+        <div
+          className="pointer-events-none absolute z-[3]"
+          style={{
+            top: "14%", bottom: "20%", right: "18%", width: "1px",
+            background: "linear-gradient(to bottom, transparent 0%, #bf00ff90 20%, #bf00ff90 75%, transparent 100%)",
+            boxShadow: "0 0 6px 2px rgba(191,0,255,0.45), 0 0 14px 5px rgba(191,0,255,0.15)",
+            animation: "neon-flicker-b 9s ease-in-out infinite 0.5s",
+          }}
+        />
+
+        {/* 11 · Top frame neon line */}
+        <div
+          className="pointer-events-none absolute inset-x-0 z-[3]"
+          style={{
+            top: "6.5%",
+            height: "1px",
+            background: "linear-gradient(to right, transparent 0%, #00e5ff30 18%, #00e5ff55 50%, #00e5ff30 82%, transparent 100%)",
+            animation: "corner-pulse 8s ease-in-out infinite",
+          }}
+        />
+
+        {/* 12 · HUD corner brackets */}
+        {/* top-left */}
+        <div className="pointer-events-none absolute z-[4]" style={{ top: 90, left: 24, width: 30, height: 30, borderTop: "1.5px solid #00e5ff", borderLeft: "1.5px solid #00e5ff", boxShadow: "-2px -2px 8px rgba(0,229,255,0.5)", animation: "corner-pulse 4s ease-in-out infinite" }} />
+        {/* top-right */}
+        <div className="pointer-events-none absolute z-[4]" style={{ top: 90, right: 24, width: 30, height: 30, borderTop: "1.5px solid #00e5ff", borderRight: "1.5px solid #00e5ff", boxShadow: "2px -2px 8px rgba(0,229,255,0.5)", animation: "corner-pulse 4s ease-in-out infinite 1s" }} />
+        {/* bottom-left */}
+        <div className="pointer-events-none absolute z-[4]" style={{ bottom: 90, left: 24, width: 30, height: 30, borderBottom: "1.5px solid #bf00ff", borderLeft: "1.5px solid #bf00ff", boxShadow: "-2px 2px 8px rgba(191,0,255,0.5)", animation: "corner-pulse 4s ease-in-out infinite 2s" }} />
+        {/* bottom-right */}
+        <div className="pointer-events-none absolute z-[4]" style={{ bottom: 90, right: 24, width: 30, height: 30, borderBottom: "1.5px solid #bf00ff", borderRight: "1.5px solid #bf00ff", boxShadow: "2px 2px 8px rgba(191,0,255,0.5)", animation: "corner-pulse 4s ease-in-out infinite 3s" }} />
+
+        {/* 13 · Cyber particles — cyan + magenta */}
+        {([
+          { left: "11%", bottom: "24%", delay: "0s",    size: 2,   dur: "6s",    variant: "a" },
+          { left: "24%", bottom: "19%", delay: "1.1s",  size: 1.5, dur: "8s",    variant: "b" },
+          { left: "37%", bottom: "29%", delay: "2.4s",  size: 2,   dur: "7s",    variant: "a" },
+          { left: "51%", bottom: "17%", delay: "0.5s",  size: 2.5, dur: "7.5s",  variant: "b" },
+          { left: "63%", bottom: "23%", delay: "3.1s",  size: 2,   dur: "6.5s",  variant: "a" },
+          { left: "77%", bottom: "31%", delay: "1.6s",  size: 1.5, dur: "8.5s",  variant: "b" },
+          { left: "88%", bottom: "26%", delay: "4.3s",  size: 2,   dur: "7s",    variant: "a" },
+          { left: "18%", bottom: "48%", delay: "2.9s",  size: 1.5, dur: "10s",   variant: "b" },
+          { left: "84%", bottom: "44%", delay: "0.4s",  size: 2,   dur: "7.5s",  variant: "a" },
+          { left: "44%", bottom: "58%", delay: "5.2s",  size: 1,   dur: "11s",   variant: "b" },
+          { left: "67%", bottom: "52%", delay: "3.7s",  size: 1.5, dur: "9.5s",  variant: "a" },
+        ] as const).map((p, i) => (
+          <div
+            key={i}
+            className="pointer-events-none absolute z-[3] rounded-full"
+            style={{
+              left: p.left,
+              bottom: p.bottom,
+              width: `${p.size}px`,
+              height: `${p.size}px`,
+              backgroundColor: p.variant === "a" ? "#00e5ff" : "#bf00ff",
+              boxShadow: p.variant === "a" ? "0 0 5px 1px #00e5ff" : "0 0 5px 1px #bf00ff",
+              opacity: 0,
+              animationName: p.variant === "a" ? "cyber-particle" : "cyber-particle-b",
+              animationDuration: p.dur,
+              animationDelay: p.delay,
+              animationIterationCount: "infinite",
+              animationTimingFunction: "ease-out",
+            }}
+          />
+        ))}
+
+        {/* 14 · Side vignettes */}
+        <div className="pointer-events-none absolute inset-y-0 left-0 z-[1] w-[7%]" style={{ background: "linear-gradient(to right, #02010985, transparent)" }} />
+        <div className="pointer-events-none absolute inset-y-0 right-0 z-[1] w-[7%]" style={{ background: "linear-gradient(to left, #02010985, transparent)" }} />
+
+        {/* ══════ END ATMOSPHERE ══════ */}
+
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-black/65 via-black/20 to-transparent" />
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-56"
+          style={{ background: "linear-gradient(to top, #020109 0%, #020109aa 40%, transparent 100%)" }}
+        />
+
+        {/* ── ARIA holographic nameplate ── */}
+        {!sessionOpen && (
+          <div
+            className="pointer-events-none absolute inset-x-0 z-10 flex justify-center"
+            style={{ bottom: "28%" }}
+          >
+            <div className="flex flex-col items-center gap-2">
+              {/* HUD-style identity plate */}
               <div
-                className="rounded-lg border px-5 py-1.5 backdrop-blur-sm"
+                className="relative px-7 py-2 backdrop-blur-md"
                 style={{
-                  borderColor: `${robot.color}55`,
-                  backgroundColor: `${robot.color}18`,
+                  borderTop:    `1px solid ${ROBOTS[0].color}90`,
+                  borderBottom: `1px solid ${ROBOTS[0].color}90`,
+                  borderLeft:   `1px solid ${ROBOTS[0].color}28`,
+                  borderRight:  `1px solid ${ROBOTS[0].color}28`,
+                  background: `linear-gradient(135deg, ${ROBOTS[0].color}18, transparent 60%, ${ROBOTS[0].color}0a)`,
                 }}
               >
-                <p
-                  className="text-xs font-bold uppercase tracking-[0.28em]"
-                  style={{ color: robot.color }}
-                >
-                  {robot.name}
+                {/* Corner brackets */}
+                <div className="absolute left-0 top-0 h-2.5 w-2.5 border-l border-t" style={{ borderColor: ROBOTS[0].color }} />
+                <div className="absolute right-0 top-0 h-2.5 w-2.5 border-r border-t" style={{ borderColor: ROBOTS[0].color }} />
+                <div className="absolute bottom-0 left-0 h-2.5 w-2.5 border-b border-l" style={{ borderColor: ROBOTS[0].color }} />
+                <div className="absolute bottom-0 right-0 h-2.5 w-2.5 border-b border-r" style={{ borderColor: ROBOTS[0].color }} />
+                <p className="text-sm font-bold tracking-[0.55em] uppercase" style={{ color: ROBOTS[0].color }}>
+                  {ROBOTS[0].name}
                 </p>
               </div>
-              {/* Personality subtitle */}
-              <p className="text-[10px] tracking-wide text-white/40">{robot.personality}</p>
-            </div>
-          ))}
-        </div>
-
-        {!sessionOpen && (
-          <div className="pointer-events-none absolute inset-x-0 bottom-8 z-20 mx-auto w-full max-w-[1100px] px-4">
-            <div className="mx-auto max-w-xl rounded-[28px] border border-white/10 bg-slate-950/38 px-5 py-4 text-center text-white backdrop-blur-xl">
-              <p className="text-xs uppercase tracking-[0.34em] text-sky-200/75">Lobby Floor</p>
-              <p className="mt-3 text-base leading-8 text-slate-100">
-                {lobbyStatus}
+              <p className="text-[9px] tracking-[0.38em] uppercase" style={{ color: `${ROBOTS[0].color}55` }}>
+                AI Banking Concierge · Unit 01
               </p>
+            </div>
+          </div>
+        )}
+
+        {/* ── Bottom info section — replaces Lobby Floor card ── */}
+        {!sessionOpen && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-5 z-20 flex flex-col items-center gap-3 px-6">
+            {/* Live status line */}
+            <div className="flex items-center gap-3">
+              <div className="h-px w-14" style={{ background: "linear-gradient(to right, transparent, rgba(0,229,255,0.4))" }} />
+              <div className="flex items-center gap-1.5">
+                <span className="relative flex h-[7px] w-[7px]">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-60" />
+                  <span className="relative inline-flex h-[7px] w-[7px] rounded-full bg-cyan-400" />
+                </span>
+                <span className="text-[9px] font-medium tracking-[0.42em] uppercase" style={{ color: "rgba(0,229,255,0.85)" }}>
+                  ARIA Online · Ready
+                </span>
+              </div>
+              <div className="h-px w-14" style={{ background: "linear-gradient(to left, transparent, rgba(0,229,255,0.4))" }} />
+            </div>
+
+            {/* CTA */}
+            <p className="text-[12px] tracking-wide text-white/35">
+              Click ARIA to begin your secure banking session
+            </p>
+
+            {/* Capability chips */}
+            <div className="flex flex-wrap justify-center gap-2">
+              {(["Voice Enabled", "Face Recognition", "PIN Secured", "Live Balances", "AI Assistant"] as const).map((feat) => (
+                <span
+                  key={feat}
+                  className="rounded-full px-3 py-0.5 text-[9px] tracking-wider"
+                  style={{
+                    border: "1px solid rgba(0,229,255,0.15)",
+                    background: "rgba(0,229,255,0.04)",
+                    color: "rgba(0,229,255,0.5)",
+                  }}
+                >
+                  {feat}
+                </span>
+              ))}
             </div>
           </div>
         )}
@@ -765,47 +1074,85 @@ export default function Home() {
               }}
             />
 
-            {/* Top-left: robot identity chip + leave */}
-            <div className="absolute left-4 top-[80px] z-40 flex items-center gap-2 sm:left-6">
-              <div
-                className="flex items-center gap-2 rounded-full border bg-slate-950/60 px-3 py-1.5 text-white backdrop-blur-xl"
-                style={{ borderColor: `${selectedRobot.color}50` }}
-              >
-                <span
-                  className="h-1.5 w-1.5 rounded-full"
-                  style={{
-                    backgroundColor: selectedRobot.color,
-                    boxShadow: sessionStage === "listening"
-                      ? `0 0 6px 2px ${selectedRobot.color}`
-                      : "none",
-                  }}
-                />
-                <span className="text-xs font-semibold tracking-wide">{selectedRobot.name}</span>
-                {recognisedName && (
-                  <span className="text-xs text-emerald-300/80">· {recognisedName}</span>
-                )}
+            {/* Top-left: robot identity chip + microcopy + leave */}
+            <div className="absolute left-4 top-[80px] z-40 flex flex-col gap-1 sm:left-6">
+              <div className="flex items-center gap-2">
+                <div
+                  className="flex items-center gap-2 rounded-full border bg-slate-950/60 px-3 py-1.5 text-white backdrop-blur-xl"
+                  style={{ borderColor: `${selectedRobot.color}50` }}
+                >
+                  <span
+                    className="h-1.5 w-1.5 rounded-full transition-all duration-300"
+                    style={{
+                      backgroundColor: selectedRobot.color,
+                      boxShadow: sessionStage === "listening"
+                        ? `0 0 6px 2px ${selectedRobot.color}`
+                        : "none",
+                    }}
+                  />
+                  <span className="text-xs font-semibold tracking-wide">{selectedRobot.name}</span>
+                  {recognisedName && (
+                    <span className="text-xs text-emerald-300/80">· {recognisedName}</span>
+                  )}
+                </div>
+                <button
+                  onClick={closeSession}
+                  className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1.5 text-xs text-white/50 backdrop-blur-xl transition hover:bg-white/10 hover:text-white/80"
+                >
+                  Leave
+                </button>
               </div>
-              <button
-                onClick={closeSession}
-                className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1.5 text-xs text-white/50 backdrop-blur-xl transition hover:bg-white/10 hover:text-white/80"
-              >
-                Leave
-              </button>
+              {microcopy && (
+                <p className="pl-1 text-[10px] tracking-wide text-white/35 transition-all duration-500">
+                  {microcopy}
+                </p>
+              )}
             </div>
 
-            {/* Bottom: single status word — only when active */}
+            {/* Transcript panel — 3 lines: You said / Understood / Reply */}
+            {lastTurn && (
+              <div className="absolute bottom-20 left-1/2 z-40 w-full max-w-xs -translate-x-1/2 px-4">
+                <div
+                  className="rounded-2xl border border-white/10 bg-slate-950/65 px-4 py-3 backdrop-blur-xl"
+                  style={{ borderColor: `${selectedRobot.color}22` }}
+                >
+                  {(
+                    [
+                      { label: "You said", value: lastTurn.said, accent: false },
+                      { label: "Understood", value: lastTurn.understood, accent: true },
+                      { label: "Answer", value: lastTurn.reply, accent: false },
+                    ] as { label: string; value: string; accent: boolean }[]
+                  ).map(({ label, value, accent }) => (
+                    <div key={label} className="flex items-start gap-2 py-0.5">
+                      <span className="w-[72px] shrink-0 text-[10px] text-white/30">{label}</span>
+                      <span
+                        className="line-clamp-2 text-[10px] leading-relaxed"
+                        style={{ color: accent ? selectedRobot.color : "rgba(255,255,255,0.65)" }}
+                      >
+                        {value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Bottom: 4-state status word */}
             <div className="absolute inset-x-0 bottom-7 z-40 flex justify-center">
               <span
                 className="text-[11px] font-light tracking-[0.32em] uppercase transition-all duration-300"
                 style={{
                   color: sessionStage === "listening"
                     ? selectedRobot.color
-                    : "rgba(255,255,255,0.28)",
+                    : (cameraState === "matching" || identityState === "confirming")
+                      ? "#f59e0b"
+                      : "rgba(255,255,255,0.28)",
                   opacity: (sessionStage === "listening" || sessionStage === "processing" || isRobotSpeaking) ? 1 : 0,
                 }}
               >
                 {sessionStage === "listening" ? "Listening"
                   : isRobotSpeaking ? "Speaking"
+                  : (cameraState === "matching" || identityState === "confirming") ? "Verifying"
                   : "Thinking"}
               </span>
             </div>

@@ -207,6 +207,10 @@ def detect_face(payload: DetectRequest) -> DetectResponse:
                 best_dist = dist
                 best_user = row
 
+        if best_user is not None:
+            log.info(f"[FACE] Best match distance: {best_dist}")
+            print(f"[FACE] Best match distance: {best_dist}")
+
         if best_dist > settings.face_match_threshold or best_user is None:
             return DetectResponse(
                 detected=True,

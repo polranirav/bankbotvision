@@ -8,47 +8,28 @@ import { Robot, Desk, ROBOTS, type RobotDef } from "./Robot";
 import { Suspense } from "react";
 import { Canvas } from "@react-three/fiber";
 
-// Desk positions — 3 stations spread across the lobby
-const DESK_POSITIONS: [number, number, number][] = [
-  [-4.2, -0.3, 0],
-  [ 0,   -0.3, 0],
-  [ 4.2, -0.3, 0],
-];
+const DESK_POS: [number, number, number] = [0, -0.3, 0];
+const ROBOT_POS: [number, number, number] = [0, 0.52, -0.55];
 
-// Robot sits just behind and above the desk surface
-const ROBOT_OFFSETS: [number, number, number][] = [
-  [-4.2, 0.52, -0.55],
-  [ 0,   0.52, -0.55],
-  [ 4.2, 0.52, -0.55],
-];
+// ── Camera rig ────────────────────────────────────────────────────────────────
+type CameraProps = { focused: boolean };
 
-const DESK_ACTIVITIES: Array<"typing" | "waiting" | "waiting"> = [
-  "typing",
-  "waiting",
-  "waiting",
-];
-
-// ── Camera rig — lerps toward selected desk ──────────────────────────────────
-type CameraProps = { focusIndex: number | null };
-
-function CameraRig({ focusIndex }: CameraProps) {
+function CameraRig({ focused }: CameraProps) {
   const { camera } = useThree();
   const targetPos = useRef(new THREE.Vector3(0, 1.8, 9));
   const targetLook = useRef(new THREE.Vector3(0, 0, 0));
   const currentLook = useRef(new THREE.Vector3(0, 0.35, 0));
 
   useFrame(() => {
-    if (focusIndex !== null) {
-      // Centered, intentional — robot at ~70% visual scale with clear space
-      const dx = DESK_POSITIONS[focusIndex][0];
-      targetPos.current.set(dx * 0.84, 1.05, 3.0);
-      targetLook.current.set(dx, 0.68, -0.1);
+    if (focused) {
+      targetPos.current.set(0, 1.05, 3.0);
+      targetLook.current.set(0, 0.68, -0.1);
     } else {
       targetPos.current.set(0, 1.8, 9);
       targetLook.current.set(0, 0.25, 0);
     }
 
-    const speed = focusIndex !== null ? 0.055 : 0.045;
+    const speed = focused ? 0.055 : 0.045;
     camera.position.lerp(targetPos.current, speed);
     currentLook.current.lerp(targetLook.current, speed + 0.02);
     camera.lookAt(currentLook.current);
@@ -57,16 +38,16 @@ function CameraRig({ focusIndex }: CameraProps) {
   return null;
 }
 
-// ── Floor ────────────────────────────────────────────────────────────────────
+// ── Floor ─────────────────────────────────────────────────────────────────────
 function LobbyFloor() {
   return (
     <>
-      {/* Main floor */}
+      {/* Main floor — dark reflective tile */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.3, 0]} receiveShadow>
         <planeGeometry args={[30, 20]} />
-        <meshStandardMaterial color="#0f172a" roughness={0.8} metalness={0.1} />
+        <meshStandardMaterial color="#03000f" roughness={0.3} metalness={0.6} />
       </mesh>
-      {/* Floor tiles pattern — alternating subtle squares */}
+      {/* Alternating tiles */}
       {Array.from({ length: 9 }, (_, col) =>
         Array.from({ length: 5 }, (_, row) => {
           const x = (col - 4) * 3;
@@ -75,130 +56,161 @@ function LobbyFloor() {
           return (
             <mesh key={`${col}-${row}`} rotation={[-Math.PI / 2, 0, 0]} position={[x, -1.295, z]}>
               <planeGeometry args={[2.9, 2.9]} />
-              <meshStandardMaterial color="#111827" roughness={0.9} />
+              <meshStandardMaterial color="#07001c" roughness={0.4} metalness={0.5} />
             </mesh>
           );
         })
       )}
+      {/* Neon glow plane under desk — robot standing platform */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1.285, 0.2]}>
+        <planeGeometry args={[3.8, 2.8]} />
+        <meshStandardMaterial
+          color="#00e5ff" emissive="#00e5ff" emissiveIntensity={0.07}
+          transparent opacity={0.3} depthWrite={false}
+        />
+      </mesh>
       {/* Back wall */}
       <mesh position={[0, 2, -4]} receiveShadow>
         <planeGeometry args={[30, 10]} />
-        <meshStandardMaterial color="#0c1220" roughness={0.9} />
+        <meshStandardMaterial color="#02000c" roughness={0.9} />
       </mesh>
-      {/* Dividers between desks */}
-      {[-2.1, 2.1].map((x) => (
-        <mesh key={x} position={[x, 0.5, -0.5]}>
-          <boxGeometry args={[0.06, 2.4, 1.8]} />
-          <meshStandardMaterial color="#1e293b" roughness={0.6} metalness={0.2} />
-        </mesh>
-      ))}
-      {/* Counter base */}
+      {/* Counter front panel — dark chrome */}
       <mesh position={[0, -0.85, 0.62]}>
-        <boxGeometry args={[14, 0.9, 0.22]} />
-        <meshStandardMaterial color="#111827" roughness={0.5} metalness={0.3} />
+        <boxGeometry args={[6, 0.9, 0.22]} />
+        <meshStandardMaterial color="#070616" roughness={0.2} metalness={0.8} />
+      </mesh>
+      {/* Counter neon edge — bright cyan strip */}
+      <mesh position={[0, -0.42, 0.74]}>
+        <boxGeometry args={[6.1, 0.02, 0.02]} />
+        <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={5} />
       </mesh>
     </>
   );
 }
 
-// ── Ambient décor ─────────────────────────────────────────────────────────────
+// ── Décor ─────────────────────────────────────────────────────────────────────
 function LobbyDecor() {
   return (
     <>
-      {/* Ceiling strip lights */}
-      {[-4.2, 0, 4.2].map((x, i) => (
-        <group key={i} position={[x, 3.5, -1]}>
-          <mesh>
-            <boxGeometry args={[1.8, 0.06, 0.3]} />
-            <meshStandardMaterial color="#e2e8f0" emissive="#e2e8f0" emissiveIntensity={0.3} />
-          </mesh>
-          <pointLight position={[0, -0.5, 0]} intensity={0.8} color="#f0f9ff" distance={6} />
-        </group>
-      ))}
-      {/* BankBot Vision sign on back wall */}
+      {/* Ceiling neon strip — cyan center */}
+      <group position={[0, 3.5, -0.8]}>
+        <mesh>
+          <boxGeometry args={[2.4, 0.04, 0.16]} />
+          <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={1.5} />
+        </mesh>
+      </group>
+      {/* Ceiling neon — magenta left */}
+      <group position={[-3.8, 3.3, -1.4]}>
+        <mesh>
+          <boxGeometry args={[1.8, 0.03, 0.1]} />
+          <meshStandardMaterial color="#bf00ff" emissive="#bf00ff" emissiveIntensity={1.8} />
+        </mesh>
+        <pointLight position={[0, -0.5, 0]} intensity={1.2} color="#bf00ff" distance={7} />
+      </group>
+      {/* Ceiling neon — magenta right */}
+      <group position={[3.8, 3.3, -1.4]}>
+        <mesh>
+          <boxGeometry args={[1.8, 0.03, 0.1]} />
+          <meshStandardMaterial color="#bf00ff" emissive="#bf00ff" emissiveIntensity={1.8} />
+        </mesh>
+        <pointLight position={[0, -0.5, 0]} intensity={1.2} color="#bf00ff" distance={7} />
+      </group>
+      {/* Wall banner + neon underline */}
       <group position={[0, 2.8, -3.9]}>
         <mesh>
           <planeGeometry args={[4, 0.6]} />
-          <meshStandardMaterial color="#0f172a" />
+          <meshStandardMaterial color="#030012" />
         </mesh>
-        {/* Glowing accent line under sign */}
         <mesh position={[0, -0.38, 0.01]}>
-          <planeGeometry args={[4, 0.04]} />
-          <meshStandardMaterial color="#3b82f6" emissive="#3b82f6" emissiveIntensity={2} />
+          <planeGeometry args={[4.1, 0.04]} />
+          <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={4} />
         </mesh>
       </group>
+      {/* Left wall vertical neon strip */}
+      <mesh position={[-7.5, 1.5, -1.5]}>
+        <boxGeometry args={[0.025, 5.5, 0.025]} />
+        <meshStandardMaterial color="#bf00ff" emissive="#bf00ff" emissiveIntensity={3} />
+      </mesh>
+      {/* Right wall vertical neon strip */}
+      <mesh position={[7.5, 1.5, -1.5]}>
+        <boxGeometry args={[0.025, 5.5, 0.025]} />
+        <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={3} />
+      </mesh>
     </>
   );
 }
 
 // ── Scene content ─────────────────────────────────────────────────────────────
 type SceneProps = {
-  onSelectRobot: (robot: RobotDef, index: number) => void;
-  focusIndex: number | null;
-  speakingIndex: number | null;
-  listeningIndex: number | null;
+  onSelectRobot: (robot: RobotDef) => void;
+  focused: boolean;
+  speaking: boolean;
+  listening: boolean;
 };
 
-function SceneContent({ onSelectRobot, focusIndex, speakingIndex, listeningIndex }: SceneProps) {
+function SceneContent({ onSelectRobot, focused, speaking, listening }: SceneProps) {
+  const robot = ROBOTS[0];
   return (
     <>
-      <ambientLight intensity={0.25} />
-      <directionalLight position={[0, 8, 6]} intensity={0.9} castShadow color="#f0f9ff" />
-      <pointLight position={[-6, 3, 2]} intensity={0.4} color="#60a5fa" />
-      <pointLight position={[ 6, 3, 2]} intensity={0.4} color="#a78bfa" />
+      {/* Match CSS background — deep dark purple-black */}
+      <color attach="background" args={["#04010e"]} />
 
-      <ContactShadows position={[0, -1.28, 0]} opacity={0.5} scale={20} blur={2.5} far={5} />
+      <ambientLight intensity={0.18} color="#0a0025" />
+      <directionalLight position={[2, 8, 5]} intensity={0.6} castShadow color="#b0d8ff" />
+
+      {/* Front key light — illuminates robot face-on from camera side */}
+      <pointLight position={[0, 1.5, 5]} intensity={1.6} color="#0088ff" distance={12} />
+      {/* Cyberpunk neon fill lights */}
+      <pointLight position={[-7, 3, 2]} intensity={2.2} color="#00e5ff" distance={18} />
+      <pointLight position={[ 7, 3, 2]} intensity={1.8} color="#bf00ff" distance={18} />
+      {/* Uplighter from floor — neon glow on underside of desk */}
+      <pointLight position={[0, -0.9, 2.5]} intensity={1.1} color="#00e5ff" distance={6} />
+      {/* Ceiling chandelier neon */}
+      <pointLight position={[0, 3.5, -0.8]} intensity={2.0} color="#00e5ff" distance={10} />
+
+      <ContactShadows position={[0, -1.28, 0]} opacity={0.8} scale={20} blur={1.8} far={5} color="#000018" />
 
       <LobbyFloor />
       <LobbyDecor />
 
-      {ROBOTS.map((robot, i) => (
-        <group key={robot.name}>
-          <Desk
-            position={DESK_POSITIONS[i]}
-            color={robot.color}
-            active={focusIndex === i}
-            activity={DESK_ACTIVITIES[i]}
-          />
-          <Robot
-            def={robot}
-            position={ROBOT_OFFSETS[i]}
-            onClick={() => onSelectRobot(robot, i)}
-            speaking={speakingIndex === i}
-            listening={listeningIndex === i}
-            seated
-            active={focusIndex === i}
-            activity={DESK_ACTIVITIES[i]}
-          />
-        </group>
-      ))}
+      <Desk position={DESK_POS} color={robot.color} active={focused} activity="waiting" />
+      <Robot
+        def={robot}
+        position={ROBOT_POS}
+        onClick={() => onSelectRobot(robot)}
+        speaking={speaking}
+        listening={listening}
+        seated
+        active={focused}
+        activity="waiting"
+      />
 
-      <CameraRig focusIndex={focusIndex} />
+      <CameraRig focused={focused} />
     </>
   );
 }
 
 // ── Exported canvas ───────────────────────────────────────────────────────────
 type Props = {
-  onSelectRobot: (robot: RobotDef, index: number) => void;
-  focusIndex: number | null;
-  speakingIndex: number | null;
-  listeningIndex: number | null;
+  onSelectRobot: (robot: RobotDef) => void;
+  focused: boolean;
+  speaking: boolean;
+  listening: boolean;
 };
 
-export function RobotScene({ onSelectRobot, focusIndex, speakingIndex, listeningIndex }: Props) {
+export function RobotScene({ onSelectRobot, focused, speaking, listening }: Props) {
   return (
     <Canvas
       camera={{ position: [0, 1.8, 9], fov: 46 }}
       style={{ width: "100%", height: "100%" }}
-      shadows
+      shadows={{ type: THREE.PCFShadowMap }}
     >
       <Suspense fallback={null}>
         <SceneContent
           onSelectRobot={onSelectRobot}
-          focusIndex={focusIndex}
-          speakingIndex={speakingIndex}
-          listeningIndex={listeningIndex}
+          focused={focused}
+          speaking={speaking}
+          listening={listening}
         />
       </Suspense>
     </Canvas>

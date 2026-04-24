@@ -1,32 +1,15 @@
-"""Phase 4 — LangChain banking agent.
+"""Phase 4 — LangChain banking agent (ReAct-based).
 
-POST /agent/query     — natural-language question → answer string
-                        uses tool-calling with banking tools scoped to current_user
-                        supports conversation history and contextual query rewriting
-POST /agent/frontdesk — spoken lobby intent understanding + routing decisions
+POST /agent/query     — authenticated banking agent with full tool access
+POST /agent/frontdesk — spoken lobby turn: CQR → auth → ReAct agent → natural reply
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
+from functools import wraps
 from typing import Annotated, Literal
-
-
-# ── Pipeline latency timer ─────────────────────────────────────────────────────
-
-class _Timer:
-    """Lightweight per-request latency tracker."""
-    def __init__(self) -> None:
-        self._t0 = time.time()
-        self._marks: dict[str, int] = {}
-
-    def mark(self, name: str) -> None:
-        self._marks[name] = round((time.time() - self._t0) * 1000)
-
-    def log(self, logger: logging.Logger, prefix: str = "") -> None:
-        parts = "  ".join(f"{k}={v}ms" for k, v in self._marks.items())
-        total = round((time.time() - self._t0) * 1000)
-        logger.info("⏱  %s LATENCY  %s  total=%dms", prefix, parts, total)
 
 from fastapi import APIRouter, Header, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -44,10 +27,25 @@ log = logging.getLogger("bankbot.agent")
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
+# ── Latency timer ─────────────────────────────────────────────────────────────
+
+class _Timer:
+    def __init__(self) -> None:
+        self._t0 = time.time()
+        self._marks: dict[str, int] = {}
+
+    def mark(self, name: str) -> None:
+        self._marks[name] = round((time.time() - self._t0) * 1000)
+
+    def log(self, logger: logging.Logger, prefix: str = "") -> None:
+        parts = "  ".join(f"{k}={v}ms" for k, v in self._marks.items())
+        total = round((time.time() - self._t0) * 1000)
+        logger.info("⏱  %s  %s  total=%dms", prefix, parts, total)
+
+
 # ── Request / Response ────────────────────────────────────────────────────────
 
 class ChatTurn(BaseModel):
-    """A single turn in the desk conversation."""
     role: Literal["user", "assistant"]
     text: str
 
@@ -55,12 +53,12 @@ class ChatTurn(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     robot_name: str = "ARIA"
-    history: list[ChatTurn] = []   # prior turns for multi-turn context
+    history: list[ChatTurn] = []
 
 
 class QueryResponse(BaseModel):
     answer: str
-    rewritten_query: str | None = None   # the cleaned query (for debugging / UX)
+    rewritten_query: str | None = None
 
 
 class DeskMessage(BaseModel):
@@ -72,77 +70,61 @@ class FrontDeskRequest(BaseModel):
     utterance: str
     robot_name: str = "ARIA"
     recognised_name: str | None = None
+    user_id: str | None = None
     has_face_match: bool = False
     has_magic_link: bool = False
+    pin_verified: bool = False
     history: list[DeskMessage] = []
-    # Session state — frontend echoes back what the backend last returned
     clarification_count: int = 0
     auth_state: Literal["none", "face_matched", "confirmed"] = "none"
     customer_type: Literal["unknown", "existing", "new"] = "unknown"
+    pending_query: str | None = None  # query buffered before auth completed
 
 
 class FrontDeskResponse(BaseModel):
     summary: str
     reply: str
-    intent: Literal["open-account", "documents", "account-help", "general", "clarify"]
+    intent: str = "general"
     should_route: bool = False
     route_target: Literal["none", "signup", "login", "magic_link"] = "none"
     confidence: float = 0.0
-    # Session state deltas — frontend stores and echoes back next turn
     risk_level: Literal["low", "medium", "high"] = "low"
-    escalate: bool = False          # suggest human handoff
-    clarification_count: int = 0    # updated count to echo back
-    intent_module: str = "general"  # which module handled this turn
+    escalate: bool = False
+    clarification_count: int = 0
+    intent_module: str = "general"
+    pin_verified: bool = False
 
 
-# ── LangChain Tools (injected with user_id + supabase at call time) ───────────
+# ── Banking tools ─────────────────────────────────────────────────────────────
 
-def _make_tools(user_id: str, sb: Client):
-    """Return banking tools closed over the authenticated user.
+def _make_tools(user_id: str, sb: Client, *, can_execute: bool = False):
+    """Return banking tools for a user.
 
-    Covers every field in the accounts and expenses tables so the agent
-    can answer any question a customer might ask at a bank teller desk.
+    Read tools are always available. Action tools (transfer, pay credit card)
+    are only included when can_execute=True (i.e. PIN-verified).
     """
-
-    # ── Read tools ────────────────────────────────────────────────────────
 
     @tool
     def get_profile(_: str = "") -> str:
-        """Return the customer's personal profile: full name, address,
-        date of birth, when they joined, and whether Face ID is set up."""
-        res = (
-            sb.table("accounts")
-            .select("first_name,last_name,address,date_of_birth,"
-                    "face_image_path,created_at")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        """Return the customer's personal profile: full name, address, date of
+        birth, when they joined, whether Face ID is set up."""
+        res = sb.table("accounts").select("*").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
         d = res.data
-        face = "Yes ✓" if d.get("face_image_path") else "No — not registered"
+        face = "Yes" if d.get("face_image_path") else "No"
         return (
             f"Name: {d['first_name']} {d['last_name']}\n"
             f"Address: {d.get('address') or 'Not on file'}\n"
             f"Date of birth: {d.get('date_of_birth') or 'Not on file'}\n"
             f"Member since: {d['created_at'][:10]}\n"
-            f"Face ID registered: {face}"
+            f"Face ID: {face}"
         )
 
     @tool
     def get_account_summary(_: str = "") -> str:
-        """Return a complete overview of the customer's account: name,
-        all balances, credit score, available credit, net position, last
-        login, and member-since date.  Use this for broad questions like
-        'tell me everything' or 'give me a summary'."""
-        res = (
-            sb.table("accounts")
-            .select("*")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        """Return a complete overview: all balances, credit info, net position."""
+        res = sb.table("accounts").select("*").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
         d = res.data
@@ -151,45 +133,19 @@ def _make_tools(user_id: str, sb: Client):
         cred = float(d["credit_balance"])
         lim = float(d["credit_limit"])
         avail = lim - cred
-        net = chq + sav - cred
-        score = d["credit_score"] or "N/A"
-        util = f"{cred / lim * 100:.1f}%" if lim > 0 else "N/A"
-        face = "Yes" if d.get("face_image_path") else "No"
         return (
-            f"Customer: {d['first_name']} {d['last_name']}\n"
-            f"Address: {d.get('address') or 'N/A'}\n"
-            f"DOB: {d.get('date_of_birth') or 'N/A'}\n"
-            f"Member since: {d['created_at'][:10]}\n"
-            f"─── Balances ───\n"
-            f"  Chequing: ${chq:,.2f}\n"
-            f"  Savings: ${sav:,.2f}\n"
-            f"  Credit card used: ${cred:,.2f} of ${lim:,.2f} limit\n"
-            f"  Available credit: ${avail:,.2f}\n"
-            f"  Net position (assets − debt): ${net:,.2f}\n"
-            f"─── Credit ───\n"
-            f"  Score: {score}\n"
-            f"  Utilisation: {util}\n"
-            f"─── Security ───\n"
-            f"  Face ID: {face}\n"
-            f"  Last login: {d.get('last_login_at') or 'never'}"
-            f" from {d.get('last_login_loc') or 'unknown'}"
+            f"Customer: {d['first_name']}\n"
+            f"Chequing: ${chq:,.2f}  |  Savings: ${sav:,.2f}\n"
+            f"Credit card: ${cred:,.2f} of ${lim:,.2f} limit (${avail:,.2f} available)\n"
+            f"Net position: ${chq + sav - cred:,.2f}\n"
+            f"Credit score: {d.get('credit_score') or 'not recorded on this account'}"
         )
 
     @tool
     def get_balance(account_type: str = "all") -> str:
-        """Return the customer's bank balances.
-
-        account_type can be 'chequing', 'savings', 'credit', or 'all'.
-        Use this when the customer asks about a specific account balance
-        or all balances together."""
-        res = (
-            sb.table("accounts")
-            .select("first_name,chequing_balance,savings_balance,"
-                    "credit_balance,credit_limit")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        """Return a specific balance. account_type: 'chequing', 'savings',
+        'credit', or 'all'."""
+        res = sb.table("accounts").select("*").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
         d = res.data
@@ -197,149 +153,37 @@ def _make_tools(user_id: str, sb: Client):
         sav = float(d["savings_balance"])
         cred = float(d["credit_balance"])
         lim = float(d["credit_limit"])
-        avail = lim - cred
-
         t = account_type.lower().strip()
         if "chequ" in t or "check" in t or "current" in t:
-            return f"{d['first_name']}'s chequing account: ${chq:,.2f}"
+            return f"Chequing balance: ${chq:,.2f}"
         if "sav" in t:
-            return f"{d['first_name']}'s savings account: ${sav:,.2f}"
-        if "cred" in t:
-            return (
-                f"{d['first_name']}'s credit card:\n"
-                f"  Balance owing: ${cred:,.2f}\n"
-                f"  Credit limit: ${lim:,.2f}\n"
-                f"  Available credit: ${avail:,.2f}"
-            )
-        # 'all' or unrecognised → return everything
-        return (
-            f"{d['first_name']}'s balances:\n"
-            f"  Chequing: ${chq:,.2f}\n"
-            f"  Savings: ${sav:,.2f}\n"
-            f"  Credit card balance: ${cred:,.2f} / ${lim:,.2f} limit\n"
-            f"  Available credit: ${avail:,.2f}\n"
-            f"  Total deposits: ${chq + sav:,.2f}"
-        )
+            return f"Savings balance: ${sav:,.2f}"
+        if "cred" in t or "card" in t:
+            return f"Credit card: ${cred:,.2f} owing of ${lim:,.2f} limit; ${lim-cred:,.2f} available."
+        return f"Chequing ${chq:,.2f} · Savings ${sav:,.2f} · Credit used ${cred:,.2f} of ${lim:,.2f}"
 
     @tool
     def get_credit_info(_: str = "") -> str:
-        """Return full credit details: credit score with rating category,
-        credit utilisation ratio, balance, limit, available credit, and
-        minimum payment estimate."""
-        res = (
-            sb.table("accounts")
-            .select("first_name,credit_score,credit_balance,credit_limit")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        """Return credit score, utilisation ratio, and available credit."""
+        res = sb.table("accounts").select("*").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
         d = res.data
-        score = d["credit_score"]
         used = float(d["credit_balance"] or 0)
         limit = float(d["credit_limit"] or 0)
-        avail = limit - used
-        util = f"{used / limit * 100:.1f}%" if limit > 0 else "N/A"
-
-        if score is None:
-            rating = "Not available"
-        elif score >= 760:
-            rating = f"{score} — Excellent"
-        elif score >= 725:
-            rating = f"{score} — Very Good"
-        elif score >= 660:
-            rating = f"{score} — Good"
-        elif score >= 560:
-            rating = f"{score} — Fair"
-        else:
-            rating = f"{score} — Needs Improvement"
-
-        min_payment = max(10.0, used * 0.02)  # typical 2% or $10
-
+        util = f"{used/limit*100:.1f}%" if limit > 0 else "N/A"
+        score = d.get("credit_score")
+        score_str = str(score) if score else "not recorded on this account"
         return (
-            f"Credit report for {d['first_name']}:\n"
-            f"  Credit score: {rating}\n"
-            f"  Balance owing: ${used:,.2f}\n"
-            f"  Credit limit: ${limit:,.2f}\n"
-            f"  Available credit: ${avail:,.2f}\n"
-            f"  Utilisation: {util}\n"
-            f"  Estimated minimum payment: ${min_payment:,.2f}"
-        )
-
-    @tool
-    def get_expenses(months: str = "3") -> str:
-        """Return the customer's expenses grouped by category for the
-        given number of months. Use for questions like 'what did I spend'
-        or 'show me my spending breakdown'."""
-        from datetime import date, timedelta
-        try:
-            m = max(1, min(int(months), 24))
-        except ValueError:
-            m = 3
-        since = (date.today() - timedelta(days=31 * m)).isoformat()
-        res = (
-            sb.table("expenses")
-            .select("category,amount,occurred_at")
-            .eq("user_id", user_id)
-            .gte("occurred_at", since)
-            .order("occurred_at", desc=True)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return f"No expenses found in the last {m} month(s)."
-        totals: dict[str, float] = {}
-        count: dict[str, int] = {}
-        for r in rows:
-            cat = r["category"]
-            totals[cat] = totals.get(cat, 0) + float(r["amount"])
-            count[cat] = count.get(cat, 0) + 1
-        lines = "\n".join(
-            f"  {cat}: ${amt:,.2f} ({count[cat]} transaction{'s' if count[cat] > 1 else ''})"
-            for cat, amt in sorted(totals.items(), key=lambda x: -x[1])
-        )
-        total = sum(totals.values())
-        return (
-            f"Spending breakdown — last {m} month(s):\n"
-            f"{lines}\n"
-            f"  ─────────────\n"
-            f"  TOTAL: ${total:,.2f} across {len(rows)} transactions"
-        )
-
-    @tool
-    def get_spending_for_category(category: str) -> str:
-        """Return spending for a specific category (e.g. food, rent,
-        transport, subscriptions). Use when the customer asks 'how much
-        did I spend on food' or 'what are my rent payments'."""
-        from datetime import date, timedelta
-        since = (date.today() - timedelta(days=93)).isoformat()  # ~3 months
-        res = (
-            sb.table("expenses")
-            .select("amount,occurred_at")
-            .eq("user_id", user_id)
-            .eq("category", category.lower().strip())
-            .gte("occurred_at", since)
-            .order("occurred_at", desc=True)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return f"No '{category}' expenses found in the last 3 months."
-        total = sum(float(r["amount"]) for r in rows)
-        lines = "\n".join(
-            f"  {r['occurred_at']}: ${float(r['amount']):,.2f}" for r in rows
-        )
-        return (
-            f"'{category.capitalize()}' spending (last 3 months):\n"
-            f"{lines}\n"
-            f"  Total: ${total:,.2f} across {len(rows)} transactions"
+            f"Credit score: {score_str}\n"
+            f"Balance: ${used:,.2f} of ${limit:,.2f} limit\n"
+            f"Utilisation: {util}\n"
+            f"Available credit: ${limit - used:,.2f}"
         )
 
     @tool
     def get_recent_transactions(limit: str = "10") -> str:
-        """Return the customer's most recent individual transactions
-        (expenses) as a list with dates, categories, and amounts."""
+        """Return the customer's most recent transactions (expenses)."""
         try:
             n = max(1, min(int(limit), 50))
         except ValueError:
@@ -354,1013 +198,631 @@ def _make_tools(user_id: str, sb: Client):
         )
         rows = res.data or []
         if not rows:
-            return "No transactions found."
+            return "No recent transactions found."
         lines = "\n".join(
-            f"  {r['occurred_at']} | {r['category']:15s} | ${float(r['amount']):,.2f}"
-            for r in rows
+            f"{r['occurred_at']} · {r['category']} · ${float(r['amount']):,.2f}" for r in rows
         )
         return f"Last {len(rows)} transactions:\n{lines}"
 
     @tool
-    def get_net_worth(_: str = "") -> str:
-        """Calculate and return the customer's net financial position:
-        total assets (chequing + savings) minus liabilities (credit card
-        balance)."""
+    def get_expenses(months: str = "3") -> str:
+        """Return spending grouped by category for the last N months."""
+        from datetime import date, timedelta
+        try:
+            m = max(1, min(int(months), 24))
+        except ValueError:
+            m = 3
+        since = (date.today() - timedelta(days=31 * m)).isoformat()
         res = (
-            sb.table("accounts")
-            .select("first_name,chequing_balance,savings_balance,"
-                    "credit_balance")
+            sb.table("expenses")
+            .select("category,amount")
             .eq("user_id", user_id)
-            .maybe_single()
+            .gte("occurred_at", since)
             .execute()
         )
-        if not res.data:
-            return "Account not found."
-        d = res.data
-        chq = float(d["chequing_balance"])
-        sav = float(d["savings_balance"])
-        cred = float(d["credit_balance"])
-        assets = chq + sav
-        net = assets - cred
-        return (
-            f"{d['first_name']}'s financial snapshot:\n"
-            f"  Total deposits: ${assets:,.2f}\n"
-            f"    Chequing: ${chq:,.2f}\n"
-            f"    Savings: ${sav:,.2f}\n"
-            f"  Credit card debt: ${cred:,.2f}\n"
-            f"  ─────────────\n"
-            f"  Net position: ${net:,.2f}"
-        )
+        rows = res.data or []
+        if not rows:
+            return f"No expenses in the last {m} month(s)."
+        totals: dict[str, float] = {}
+        for r in rows:
+            totals[r["category"]] = totals.get(r["category"], 0) + float(r["amount"])
+        lines = "\n".join(f"{cat}: ${amt:,.2f}" for cat, amt in sorted(totals.items(), key=lambda x: -x[1]))
+        total = sum(totals.values())
+        return f"Spending last {m} month(s):\n{lines}\nTotal: ${total:,.2f}"
 
-    @tool
-    def get_last_login(_: str = "") -> str:
-        """Return when and where the customer last logged in, plus
-        whether Face ID is set up (security status)."""
-        res = (
-            sb.table("accounts")
-            .select("last_login_at,last_login_loc,face_image_path")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
-        if not res.data:
-            return "Account not found."
-        d = res.data
-        at = d.get("last_login_at") or "never"
-        loc = d.get("last_login_loc") or "unknown location"
-        face = "Registered ✓" if d.get("face_image_path") else "Not set up"
-        return (
-            f"Last login: {at} from {loc}\n"
-            f"Face ID status: {face}"
-        )
+    read_tools = [
+        get_profile,
+        get_account_summary,
+        get_balance,
+        get_credit_info,
+        get_recent_transactions,
+        get_expenses,
+    ]
 
-    # ── Action tools ──────────────────────────────────────────────────────
+    if not can_execute:
+        return read_tools
 
     @tool
     def transfer_between_accounts(direction: str, amount: str) -> str:
-        """Transfer money between chequing and savings accounts.
-
-        direction must be 'chequing_to_savings' or 'savings_to_chequing'.
-        amount is the dollar amount to transfer (e.g. '500')."""
+        """Move money between chequing and savings accounts.
+        direction: 'chequing_to_savings' or 'savings_to_chequing'.
+        amount: dollar amount (e.g. '300')."""
         try:
             amt = round(float(amount), 2)
             if amt <= 0:
-                return "Transfer amount must be positive."
+                return "Amount must be positive."
         except ValueError:
             return f"Invalid amount: {amount}"
-
-        res = (
-            sb.table("accounts")
-            .select("chequing_balance,savings_balance")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        res = sb.table("accounts").select("chequing_balance,savings_balance").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
-
         chq = float(res.data["chequing_balance"])
         sav = float(res.data["savings_balance"])
-
         d = direction.lower().strip()
         if d == "chequing_to_savings":
             if amt > chq:
                 return f"Insufficient funds. Chequing balance is ${chq:,.2f}."
-            new_chq = chq - amt
-            new_sav = sav + amt
-            label = "chequing → savings"
+            new_chq, new_sav = chq - amt, sav + amt
+            label = "chequing to savings"
         elif d == "savings_to_chequing":
             if amt > sav:
                 return f"Insufficient funds. Savings balance is ${sav:,.2f}."
-            new_chq = chq + amt
-            new_sav = sav - amt
-            label = "savings → chequing"
+            new_chq, new_sav = chq + amt, sav - amt
+            label = "savings to chequing"
         else:
-            return ("Invalid direction. Use 'chequing_to_savings' or "
-                    "'savings_to_chequing'.")
-
-        sb.table("accounts").update({
-            "chequing_balance": new_chq,
-            "savings_balance": new_sav,
-        }).eq("user_id", user_id).execute()
-
+            return "Invalid direction. Use 'chequing_to_savings' or 'savings_to_chequing'."
+        sb.table("accounts").update({"chequing_balance": new_chq, "savings_balance": new_sav}).eq("user_id", user_id).execute()
         return (
-            f"Transfer complete: ${amt:,.2f} moved {label}.\n"
-            f"New chequing balance: ${new_chq:,.2f}\n"
-            f"New savings balance: ${new_sav:,.2f}"
+            f"Transfer complete: ${amt:,.2f} moved {label}. "
+            f"New chequing: ${new_chq:,.2f}, savings: ${new_sav:,.2f}."
         )
 
     @tool
     def pay_credit_card(amount: str) -> str:
-        """Pay towards the credit card balance from the chequing account.
-
-        amount is the dollar amount to pay (e.g. '200'), or 'full' to
-        pay the entire outstanding balance."""
-        res = (
-            sb.table("accounts")
-            .select("chequing_balance,credit_balance")
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        )
+        """Pay toward the credit card balance from chequing.
+        amount: dollars (e.g. '200') or 'full'."""
+        res = sb.table("accounts").select("chequing_balance,credit_balance").eq("user_id", user_id).maybe_single().execute()
         if not res.data:
             return "Account not found."
-
         chq = float(res.data["chequing_balance"])
         cred = float(res.data["credit_balance"])
-
+        if cred <= 0:
+            return "Your credit card has no outstanding balance."
         if amount.lower().strip() == "full":
             amt = cred
         else:
             try:
                 amt = round(float(amount), 2)
                 if amt <= 0:
-                    return "Payment amount must be positive."
+                    return "Amount must be positive."
             except ValueError:
                 return f"Invalid amount: {amount}"
-
-        if cred <= 0:
-            return "No credit card balance to pay — you're all clear!"
         if amt > cred:
-            amt = cred  # cap at outstanding balance
+            amt = cred
         if amt > chq:
-            return (
-                f"Insufficient funds in chequing (${chq:,.2f}) to pay "
-                f"${amt:,.2f}. Try a smaller amount."
-            )
+            return f"Insufficient chequing funds (${chq:,.2f}) to pay ${amt:,.2f}."
+        new_chq, new_cred = chq - amt, cred - amt
+        sb.table("accounts").update({"chequing_balance": new_chq, "credit_balance": new_cred}).eq("user_id", user_id).execute()
+        return f"Paid ${amt:,.2f}. New chequing: ${new_chq:,.2f}, credit owing: ${new_cred:,.2f}."
 
-        new_chq = chq - amt
-        new_cred = cred - amt
-
-        sb.table("accounts").update({
-            "chequing_balance": new_chq,
-            "credit_balance": new_cred,
-        }).eq("user_id", user_id).execute()
-
-        return (
-            f"Credit card payment of ${amt:,.2f} processed.\n"
-            f"New chequing balance: ${new_chq:,.2f}\n"
-            f"New credit card balance: ${new_cred:,.2f}"
-        )
-
-    return [
-        # Read tools
-        get_profile,
-        get_account_summary,
-        get_balance,
-        get_credit_info,
-        get_expenses,
-        get_spending_for_category,
-        get_recent_transactions,
-        get_net_worth,
-        get_last_login,
-        # Action tools
-        transfer_between_accounts,
-        pay_credit_card,
-    ]
+    return read_tools + [transfer_between_accounts, pay_credit_card]
 
 
-# ── Agent personalities ───────────────────────────────────────────────────────
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
-_TOOL_GUIDANCE = (
-    " Always use the right tool — never invent numbers. "
-    "get_balance for balances · get_credit_info for credit · get_expenses or "
-    "get_spending_for_category for spending · get_profile for personal info · "
-    "get_account_summary for a full overview · transfer_between_accounts for "
-    "transfers · pay_credit_card for card payments."
-)
+_MASTER_PROMPT = """
+SYSTEM ROLE
+You are a calm, professional bank teller at BankBot Vision. You speak face-to-face with customers. Every word you say is spoken aloud.
 
-_VOICE_RULES = """
+PRIMARY GOAL
+Help the customer complete one banking task per turn. Be specific, brief, and human.
 
-UNIVERSAL BANKING CONVERSATION FLOW — follow this every turn:
-  1. INTENT  – identify what the customer actually needs in one phrase.
-  2. VERIFY  – if money movement, account changes, or sensitive data: confirm identity first.
-  3. EXECUTE – call the right tool. Never guess or fabricate data.
-  4. CONFIRM – repeat the outcome in one short sentence. ("Done. Transfer complete.")
-  5. CLOSE   – offer exactly ONE relevant next step, not a menu.
+VOICE STYLE
+- 1–2 short spoken sentences per turn. Natural English only.
+- Speak numbers as words: "twelve hundred dollars" not "$1,200.00".
+- One question per turn. Never list more than two options.
+- Never read raw data tables, bullet points, or system output verbatim.
+- Sound calm, warm, and confident. Never robotic.
 
-VOICE FORMAT RULES (mandatory):
-  • One thought per response. 1–2 spoken sentences maximum.
-  • Natural English only. Speak numbers: "twelve hundred" not "$1,200.00".
-  • Never read raw tables, bullet lists, or separator lines from tool output.
-  • Before any transaction (transfer, payment): confirm explicitly.
-    Example: "You want to move three hundred dollars from chequing to savings — should I do that?"
-  • After completing an action: short confirmation only. "Done. Transfer complete."
-  • Offer ONE next step. Not five. ("Want to see the last three transactions?")
-  • Repair question if unsure twice: "Did you mean your debit card or credit card?"
-  • If a request needs escalation: "This one needs a specialist — want me to arrange that?"
-  • Never mention tools, APIs, or internal system names.
-  • Resolve pronouns from context: 'it', 'that account', 'the other one'.
+BANKING CONVERSATION FLOW (follow every turn):
+  1. RESTATE — for action intents, say what you understood in one phrase:
+       "You want to move three hundred dollars from chequing to savings — is that right?"
+  2. CONFIRM — before any money movement or sensitive change, wait for "yes".
+  3. EXECUTE — call the right tool. Never invent numbers.
+  4. REPORT — one short confirmation sentence: "Done. Transfer complete."
+  5. NEXT — offer ONE relevant follow-up, not a menu.
+
+TOOL USE
+- When the customer asks about ANY balance (chequing, savings, credit), CALL get_balance with the right account_type. Do not guess.
+- When the customer asks about credit score or credit limit, CALL get_credit_info. Do not guess.
+- When the customer asks for a full overview or summary, CALL get_account_summary.
+- When the customer asks about transactions or spending, CALL get_recent_transactions or get_expenses.
+- When the customer confirms a pending action (says "yes"/"go ahead"), CALL the action tool.
+- Never say "I don't have access to that" — if a tool exists for it, use it immediately.
+- If a tool returns "not recorded on this account", tell the customer that field hasn't been set up yet and they can add it in account settings.
+- If no tool applies, answer from general banking knowledge in one sentence.
+
+SCRIPT PATTERNS (use as natural templates):
+  Balance inquiry : "Your chequing balance is [amount]. Want to see savings too?"
+  Transfer intent : "You want to move [amount] from [source] to [destination] — shall I do that?"
+  Transfer done   : "Done. [amount] moved. Your new chequing balance is [amount]."
+  PIN challenge   : "To confirm that, please say your four-digit PIN."
+  PIN wrong       : "That PIN doesn't match. Please try again."
+  Low confidence  : "I want to make sure I understand — did you mean [option A] or [option B]?"
+  Escalate        : "This one's better handled by a specialist. Want me to connect you?"
+  No data on file : "Your [field] hasn't been recorded yet. You can update it in your account settings — anything else I can help with?"
+  Out of scope    : "That's a bit outside what I can do here. I can help with balances, spending, or transfers — what would you like?"
+
+DO NOT
+- Ask for SSN, SIN, or any government ID. We do not store these.
+- Invent balances, transactions, or account fields that were not returned by a tool.
+- Mention tool names, API calls, or internal system labels.
+- Give more than one question or two options per turn.
+- Repeat "I want to make sure I understand — can you say that another way?" as a default. Only ask for a repeat if the transcript is genuinely unreadable.
 """
 
 _ROBOT_SYSTEM: dict[str, str] = {
-    "ARIA": (
-        "You are ARIA, a professional and warm bank teller at BankBot Vision. "
-        "You speak naturally and briefly, like a trusted teller face-to-face."
-        + _TOOL_GUIDANCE + _VOICE_RULES
-    ),
-    "MAX": (
-        "You are MAX, a fast and precise bank teller at BankBot Vision. "
-        "Direct answers, short sentences, confident tone. No filler."
-        + _TOOL_GUIDANCE + _VOICE_RULES
-    ),
-    "ZED": (
-        "You are ZED, a calm and analytical banking advisor at BankBot Vision. "
-        "Measured confidence. One brief insight when it genuinely helps."
-        + _TOOL_GUIDANCE + _VOICE_RULES
-    ),
+    "ARIA": "You are ARIA, a professional and warm bank teller. " + _MASTER_PROMPT,
+    "MAX":  "You are MAX, a fast and precise bank teller. Direct answers, short sentences, confident tone. " + _MASTER_PROMPT,
+    "ZED":  "You are ZED, a calm and analytical banking advisor. Measured, thoughtful, helpful. " + _MASTER_PROMPT,
 }
-
 DEFAULT_SYSTEM = _ROBOT_SYSTEM["ARIA"]
 
 
-# ── Contextual Query Rewriting (CQR) ─────────────────────────────────────────
+# ── Intent classification (keyword-based, no LLM call) ────────────────────────
 
-_CQR_PROMPT = (
-    "You are a query understanding module for a banking voice assistant. "
-    "The customer's speech may be unclear, rambling, or contain filler words. "
-    "Your job is to compress their utterance into ONE clean, precise query "
-    "that a banking agent can act on.\n\n"
-    "Rules:\n"
-    "1. Remove filler words (um, uh, like, you know, so).\n"
-    "2. Resolve pronouns using conversation history ('it' → 'my savings balance').\n"
-    "3. If the customer asks multiple things, combine into one compound query.\n"
-    "4. Preserve the customer's actual intent — do NOT add things they didn't ask.\n"
-    "5. Keep the rewrite SHORT — one sentence, max two.\n"
-    "6. If the speech is already clean and clear, return it mostly unchanged.\n"
-)
-
-_LOBBY_CQR_PROMPT = (
-    "You are a speech compression module at a virtual bank lobby kiosk. "
-    "A visitor has just spoken to a robot greeter. Their speech was captured by a "
-    "microphone and may be noisy, accented, fragmented, or full of filler words.\n\n"
-    "Your job: compress what they said into ONE clean, precise sentence that "
-    "captures their true intent.\n\n"
-    "Rules:\n"
-    "1. Remove all filler words (um, uh, like, so, you know, basically, kind of).\n"
-    "2. Fix Whisper transcription errors — e.g. 'checking' often means 'chequing', "
-    "'I want to' fragments mean the visitor wants that service.\n"
-    "3. If they said their name, keep it exactly.\n"
-    "4. Infer the banking intent: check balance / open account / loan / credit card / "
-    "mortgage / documents / speak to advisor / general question.\n"
-    "5. Output ONE sentence only. No preamble, no explanation.\n"
-    "6. If the speech is already clear and short, return it unchanged.\n"
-    "\nExamples:\n"
-    "  Raw: 'uh yeah so I was like wondering if I could maybe um check my you know balance'\n"
-    "  Clean: 'I want to check my account balance.'\n\n"
-    "  Raw: 'so I need to open a new account like a savings one'\n"
-    "  Clean: 'I want to open a new savings account.'\n\n"
-    "  Raw: 'hi my name is Nirav and I just want to know about mortgage rates'\n"
-    "  Clean: 'My name is Nirav and I want to know about mortgage rates.'\n"
-)
-
-
-@traceable(name="Query Compression (CQR)", run_type="llm", tags=["cqr", "banking"])
-def _rewrite_query(
-    raw_question: str,
-    history: list[ChatTurn],
-    llm: ChatOpenAI,
-) -> str:
-    """Compress messy speech into a clean query using conversation context.
-
-    Returns the original question unchanged if rewriting fails or the
-    input is already short and clean.
-    """
-    # Skip CQR for very short / already-clean inputs
-    words = raw_question.split()
-    if len(words) <= 8 and not history:
-        log.info("\n🔄 CQR: Skipped (short/clean input)")
-        return raw_question
-
-    log.info("\n🔄 CQR: Rewriting messy input...")
-    log.info("   Raw: %r", raw_question)
-
-    history_text = "\n".join(
-        f"{'CUSTOMER' if t.role == 'user' else 'AGENT'}: {t.text}"
-        for t in history[-6:]
-    ) or "No prior conversation."
-
-    try:
-        result = llm.invoke([
-            SystemMessage(content=_CQR_PROMPT),
-            HumanMessage(
-                content=(
-                    f"Conversation so far:\n{history_text}\n\n"
-                    f"Latest customer utterance:\n\"{raw_question}\"\n\n"
-                    f"Rewritten query:"
-                )
-            ),
-        ])
-        rewritten = result.content.strip().strip('"').strip()
-        if rewritten and len(rewritten) < len(raw_question) * 3:
-            log.info("   Clean: %r", rewritten)
-            return rewritten
-    except Exception as e:
-        log.warning("   CQR failed: %s", e)
-
-    return raw_question
-
-
-@traceable(name="Lobby Speech Compression", run_type="llm", tags=["cqr", "lobby"])
-def _compress_utterance(
-    raw_utterance: str,
-    history: list[ChatTurn],
-    llm: ChatOpenAI,
-) -> str:
-    """Lobby-tuned compression: clean up noisy voice input before frontdesk LLM.
-
-    Handles accents, Whisper artifacts, filler words, and fragmented sentences.
-    Returns original if already clean or compression fails.
-    """
-    words = raw_utterance.split()
-    # Skip compression for short utterances — most lobby speech is under 15 words
-    if len(words) <= 14:
-        return raw_utterance
-
-    log.info("\n🎙️  Lobby CQR: Compressing utterance...")
-    log.info("   Raw: %r", raw_utterance)
-
-    history_text = "\n".join(
-        f"{'VISITOR' if t.role == 'user' else 'ROBOT'}: {t.text}"
-        for t in history[-4:]
-    ) or "First visitor utterance."
-
-    try:
-        result = llm.invoke(
-            [
-                SystemMessage(content=_LOBBY_CQR_PROMPT),
-                HumanMessage(
-                    content=(
-                        f"Recent conversation:\n{history_text}\n\n"
-                        f"Latest visitor speech:\n\"{raw_utterance}\"\n\n"
-                        f"Compressed:"
-                    )
-                ),
-            ],
-            config={"run_name": f"Compress: {raw_utterance[:50]}"},
-        )
-        compressed = result.content.strip().strip('"').strip()
-        if compressed and len(compressed) < len(raw_utterance) * 2:
-            log.info("   Compressed: %r", compressed)
-            return compressed
-    except Exception as e:
-        log.warning("   Lobby CQR failed: %s", e)
-
-    return raw_utterance
-
-
-# ── Intent classification — fast keyword triage, no extra LLM call ────────────
-
-_INTENT_MAP: list[tuple[str, str, tuple[str, ...]]] = [
-    # (module, risk_level, keywords)
-    ("fraud_dispute",   "high",   ("suspicious", "fraud", "don't recognize", "dispute",
-                                   "unauthorized", "didn't make", "not mine", "scam")),
-    ("card_services",   "high",   ("lost card", "stolen card", "block card", "freeze card",
-                                   "unfreeze", "replacement card", "cancel card", "pin",
-                                   "spend limit", "travel notice")),
-    ("account_action",  "high",   ("transfer", "move money", "send money", "pay my",
-                                   "bill payment", "move from", "move to", "pay rogers",
-                                   "pay hydro", "pay bell", "chequing to savings",
-                                   "savings to chequing")),
-    ("account_read",    "medium", ("my balance", "check balance", "how much", "statement",
-                                   "transactions", "recent", "last few", "spending",
-                                   "expenses", "what did i spend", "credit score",
-                                   "available credit", "account summary", "my savings",
-                                   "my chequing", "overview")),
-    ("login_help",      "medium", ("can't log in", "locked", "forgot password",
-                                   "reset password", "otp", "verification code",
-                                   "access issue", "login help", "sign in problem")),
-    ("new_account",     "low",    ("open account", "new account", "join", "first time",
-                                   "become a customer", "sign up", "register", "apply",
-                                   "create account", "start an account")),
-    ("product_info",    "low",    ("which account", "best account", "compare", "recommend",
-                                   "cashback", "travel card", "low fee", "student account",
-                                   "business account", "interest rate", "mortgage rate")),
-    ("branch_appt",     "low",    ("branch", "location", "nearest", "in person",
-                                   "appointment", "talk to someone", "speak to a person",
-                                   "human", "advisor", "specialist", "callback")),
+_INTENT_KEYWORDS: list[tuple[str, str, tuple[str, ...]]] = [
+    # (intent, risk, keywords)
+    ("fraud_dispute",         "high",   ("fraud", "suspicious", "don't recognize", "didn't make",
+                                          "unauthorized", "dispute", "scam", "not mine")),
+    ("card_services",         "high",   ("lost card", "stolen card", "block card", "freeze card",
+                                          "cancel card", "replace card", "change pin", "travel notice")),
+    ("transfer_money",        "high",   ("transfer", "move money", "send money", "pay bill",
+                                          "pay my", "chequing to savings", "savings to chequing",
+                                          "move from", "move to", "pay credit card", "pay off")),
+    ("account_overview",      "medium", ("balance", "summary", "overview", "how much",
+                                          "credit score", "available credit", "net worth", "net position",
+                                          "my savings", "savings account", "savings balance", "my saving",
+                                          "my chequing", "chequing balance", "checking balance",
+                                          "my account", "credit limit", "credit available")),
+    ("recent_transactions",   "medium", ("transactions", "spending", "expenses", "spent",
+                                          "last few", "recent", "statement", "what did i spend",
+                                          "where did my money go", "breakdown")),
+    ("login_access_help",     "medium", ("can't log in", "locked out", "forgot password",
+                                          "reset password", "otp", "verification code", "login help")),
+    ("new_account_opening",   "low",    ("open account", "new account", "sign up", "become customer",
+                                          "first time", "join", "register", "apply", "start an account")),
+    ("product_recommendation","low",    ("which account", "best account", "compare", "recommend",
+                                          "cashback", "travel card", "mortgage rate", "loan rate",
+                                          "interest rate", "savings rate")),
+    ("branch_appointment",    "low",    ("branch", "location", "nearest", "in person",
+                                          "appointment", "human", "specialist", "advisor", "speak to")),
+    ("public_info",           "low",    ("hours", "about your bank", "how does", "what is",
+                                          "tell me about", "your services")),
+    ("greeting",              "low",    ("hello", "hi there", "hey there", "good morning",
+                                          "good afternoon", "what's up")),
 ]
 
 
-def _classify_intent(utterance: str) -> tuple[str, str]:
-    """Keyword triage → (intent_module, risk_level). O(n) with no LLM call."""
-    lower = utterance.lower()
-    for module, risk, keywords in _INTENT_MAP:
+def _classify_intent(text: str) -> tuple[str, str]:
+    """Keyword-based intent classification. Returns (intent, risk_level)."""
+    lower = text.lower()
+    for intent, risk, keywords in _INTENT_KEYWORDS:
         if any(k in lower for k in keywords):
-            return module, risk
-    return "general", "low"
+            return intent, risk
+    return "unknown", "low"
 
 
-def _auth_gate(
-    risk_level: str,
-    payload: FrontDeskRequest,
-) -> FrontDeskResponse | None:
-    """Return a deflect response when the visitor's auth level is insufficient.
+# ── PIN extraction and verification ──────────────────────────────────────────
 
-    Returns None when the request can proceed normally.
-    """
-    if risk_level == "low":
-        return None  # public info — no auth needed
-
-    if risk_level == "medium" and payload.has_face_match:
-        return None  # face match is sufficient for read-only account data
-
-    if risk_level == "high" and payload.has_face_match and payload.has_magic_link:
-        return None  # full session available — proceed
-
-    # Not enough auth — deflect cleanly and calmly
-    name_part = f", {payload.recognised_name}" if payload.recognised_name else ""
-    if payload.has_face_match:
-        reply = (
-            f"I can help with that{name_part} — I just need to open a secure session first. "
-            "Shall I do that?"
-        )
-    else:
-        reply = "I can help with that. Could you confirm your name so I can verify you?"
-
-    return FrontDeskResponse(
-        summary="Auth insufficient for this request.",
-        reply=reply,
-        intent="account-help",
-        should_route=False,
-        route_target="none",
-        confidence=0.88,
-        risk_level=risk_level,
-        clarification_count=payload.clarification_count,
-        intent_module="auth_gate",
-    )
-
-
-# ── Module-specific prompt snippets injected into the system prompt ───────────
-
-_MODULE_PROMPTS: dict[str, str] = {
-    "account_read": (
-        "MODULE: Account Read. The visitor wants to see their account data. "
-        "Auth is already confirmed for this request. Retrieve and speak data naturally. "
-        "Say balances in plain English. Offer ONE follow-up only."
-    ),
-    "account_action": (
-        "MODULE: Account Action. MONEY MOVEMENT — highest risk. "
-        "Follow this exactly: (1) state what you understood, "
-        "(2) ask 'Should I proceed?' — wait for yes, "
-        "(3) execute, (4) confirm in one sentence. Never skip the confirmation step."
-    ),
-    "card_services": (
-        "MODULE: Card Services. Lead with empathy. "
-        "Offer the most urgent action first (block card). "
-        "Confirm before any irreversible step. "
-        "Ask: 'Do you want me to block it now and start a replacement?'"
-    ),
-    "fraud_dispute": (
-        "MODULE: Fraud Dispute. Stay calm and move quickly. "
-        "Ask for merchant name or amount to find the transaction. "
-        "Offer to flag it and protect the card immediately. "
-        "Escalate to specialist if visitor is distressed."
-    ),
-    "new_account": (
-        "MODULE: New Account. Guide with curiosity, not a menu. "
-        "Ask: 'Are you looking for everyday banking, savings, student, or business?' "
-        "Recommend the best fit in one sentence. Explain why in one phrase."
-    ),
-    "product_info": (
-        "MODULE: Product Info. Answer from general banking knowledge. "
-        "Focus on what the visitor actually needs — low fees, rewards, or savings rate. "
-        "Recommend one product with one clear reason."
-    ),
-    "login_help": (
-        "MODULE: Login Help. Ask which issue: locked account, forgotten password, or OTP. "
-        "Guide through the right resolution. "
-        "If repeated failure: 'This might need a specialist — want me to arrange that?'"
-    ),
-    "branch_appt": (
-        "MODULE: Branch / Appointment. Offer: find nearest branch OR book a specialist callback. "
-        "Ask which they prefer. Keep it simple — one sentence."
-    ),
-    "general": (
-        "MODULE: General. Respond naturally. "
-        "If intent is unclear, ask ONE focused clarifying question."
-    ),
+_WORD_TO_DIGIT: dict[str, str] = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "won": "1",
+    "two": "2", "to": "2", "too": "2",
+    "three": "3", "tree": "3",
+    "four": "4", "for": "4", "fore": "4",
+    "five": "5",
+    "six": "6", "sex": "6",
+    "seven": "7",
+    "eight": "8", "ate": "8",
+    "nine": "9", "nein": "9",
 }
 
 
-def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
-    return any(term in text for term in terms)
+def _normalize_pin(text: str) -> str:
+    """Convert any Whisper output of a spoken PIN into a plain digit string.
 
-
-def _fallback_frontdesk_response(payload: FrontDeskRequest) -> FrontDeskResponse:
-    lower = payload.utterance.lower().strip()
-    prior_agent = next((m.text.lower() for m in reversed(payload.history) if m.role == "agent"), "")
-
-    summary = payload.utterance.strip() or "The visitor needs help at the front desk."
-
-    if not lower:
-        return FrontDeskResponse(
-            summary="The visitor has not said anything yet.",
-            reply="I'm right here — what can I help you with today?",
-            intent="clarify",
-            confidence=0.1,
-        )
-
-    is_confirmation = (
-        lower in {
-            "yes",
-            "yeah",
-            "yep",
-            "sure",
-            "okay",
-            "ok",
-            "go ahead",
-            "please do",
-            "let's do it",
-            "continue",
-        }
-        or lower.startswith("yes")
-        or lower.startswith("yeah")
-        or lower.startswith("sure")
-        or lower.startswith("ok")
-        or lower.startswith("okay")
-    )
-
-    wants_open_account = _contains_any(
-        lower,
-        (
-            "open account",
-            "create account",
-            "new account",
-            "first visit",
-            "first time",
-            "join the bank",
-            "become a customer",
-        ),
-    )
-    wants_documents = _contains_any(
-        lower,
-        ("passport", "document", "documents", "identification", "paperwork", "form", "id "),
-    )
-    wants_sensitive_account_help = _contains_any(
-        lower,
-        (
-            "balance",
-            "money",
-            "credit score",
-            "credit card",
-            "invest",
-            "investment",
-            "loan",
-            "mortgage",
-            "account details",
-            "transactions",
-            "savings",
-            "checking",
-            "chequing",
-            "card",
-        ),
-    )
-
-    if wants_open_account:
-        if _contains_any(lower, ("go ahead", "start now", "open it now", "let's do it", "proceed")):
-            return FrontDeskResponse(
-                summary="The visitor wants to open a new bank account now.",
-                reply="Perfect, I'll get that started for you right now.",
-                intent="open-account",
-                should_route=True,
-                route_target="signup",
-                confidence=0.93,
-            )
-        return FrontDeskResponse(
-            summary="The visitor wants to open a new bank account.",
-            reply="Of course! I just need a moment to set that up — shall I start the account opening now?",
-            intent="open-account",
-            confidence=0.82,
-        )
-
-    if wants_sensitive_account_help:
-        if payload.has_face_match and payload.has_magic_link and (
-            is_confirmation or "open your secure banking" in prior_agent or "take you inside" in prior_agent
-        ):
-            return FrontDeskResponse(
-                summary="The visitor wants secure help with their existing account and agreed to continue inside.",
-                reply=(
-                    f"I have what I need{f', {payload.recognised_name}' if payload.recognised_name else ''}. "
-                    "I am opening your secure banking session now."
-                ),
-                intent="account-help",
-                should_route=True,
-                route_target="magic_link",
-                confidence=0.95,
-            )
-        if payload.has_face_match and payload.has_magic_link:
-            return FrontDeskResponse(
-                summary="The visitor wants account-specific help that requires secure access.",
-                reply=(
-                    f"Happy to help{f', {payload.recognised_name}' if payload.recognised_name else ''}. "
-                    "Want me to open a secure session so I can pull that up?"
-                ),
-                intent="account-help",
-                confidence=0.86,
-            )
-        if is_confirmation and ("secure sign-in" in prior_agent or "sign you in" in prior_agent):
-            return FrontDeskResponse(
-                summary="The visitor agreed to continue through secure sign-in.",
-                reply="Great, taking you there now.",
-                intent="account-help",
-                should_route=True,
-                route_target="login",
-                confidence=0.9,
-            )
-        return FrontDeskResponse(
-            summary="The visitor wants account-specific help but is not securely inside yet.",
-            reply="I'd need to verify you first for that. Want me to take you to the sign-in page?",
-            intent="account-help",
-            confidence=0.84,
-        )
-
-    if wants_documents:
-        if payload.has_face_match and payload.has_magic_link and (
-            is_confirmation or "continue with your documents" in prior_agent
-        ):
-            return FrontDeskResponse(
-                summary="The visitor agreed to continue document handling inside secure banking.",
-                reply="I am opening your secure session now so we can continue with your documents safely.",
-                intent="documents",
-                should_route=True,
-                route_target="magic_link",
-                confidence=0.92,
-            )
-        if is_confirmation and ("secure sign-in" in prior_agent or "documents safely" in prior_agent):
-            return FrontDeskResponse(
-                summary="The visitor agreed to continue document handling through sign-in.",
-                reply="I am taking you to secure sign-in now so we can continue.",
-                intent="documents",
-                should_route=True,
-                route_target="login",
-                confidence=0.88,
-            )
-        return FrontDeskResponse(
-            summary="The visitor needs help with identification or documents.",
-            reply="I can help with documents and identification. Do you want me to continue in a secure session now?",
-            intent="documents",
-            confidence=0.8,
-        )
-
-    if is_confirmation:
-        if "onboarding flow" in prior_agent or "open an account" in prior_agent:
-            return FrontDeskResponse(
-                summary="The visitor confirmed they want to start opening an account.",
-                reply="I am starting the account opening flow now.",
-                intent="open-account",
-                should_route=True,
-                route_target="signup",
-                confidence=0.9,
-            )
-        if "secure banking session" in prior_agent or "secure sign-in" in prior_agent:
-            return FrontDeskResponse(
-                summary="The visitor confirmed they want to continue inside secure banking.",
-                reply=(
-                    "I am opening your secure session now."
-                    if payload.has_magic_link
-                    else "I am taking you to secure sign-in now."
-                ),
-                intent="account-help",
-                should_route=True,
-                route_target="magic_link" if payload.has_magic_link else "login",
-                confidence=0.88,
-            )
-
-    return FrontDeskResponse(
-        summary=summary,
-        reply="I'm here to help — what's the main thing you need today?",
-        intent="clarify",
-        confidence=0.45,
-    )
-
-
-def _frontdesk_system_prompt(robot_name: str) -> str:
-    return f"""You are {robot_name}, a professional bank teller at BankBot Vision's lobby.
-You are speaking face-to-face with a visitor. Every response is spoken aloud.
-
-UNIVERSAL FLOW — follow for every turn:
-  1. WELCOME   – "Hi, what can I help you with today?" (first turn only)
-  2. INTENT    – understand what they actually need. Ask ONE clarifying question if unclear.
-  3. RISK CHECK– balance / transactions / card / account changes require secure sign-in.
-               Tell them calmly: "I can help — I just need to verify you first."
-  4. SOLVE     – answer general questions directly. Guide new customers. Explain products.
-  5. CONFIRM   – repeat the next step or outcome in one sentence.
-  6. CLOSE     – offer ONE relevant next action. Nothing more.
-
-SCRIPT PATTERNS (use these as natural language templates):
-  Balance:      "I can pull that up, but I'll need to verify your identity first."
-  Transactions: "Happy to show those — I just need you to sign in securely."
-  Transfer:     "I can do that transfer after a quick identity check."
-  New account:  "Welcome! Are you looking for everyday banking, savings, student, or business?"
-  Lost card:    "I'm sorry about that. I can block it now and arrange a replacement. Shall I start?"
-  Suspicious:   "I can flag that and start a dispute — tell me the merchant name or amount."
-  Product Q:    "What matters most — low fees, cashback, or savings growth?"
-  Escalation:   "This one needs a specialist. I can connect you so you won't need to repeat yourself."
-
-REPLY RULES:
-  • 1–2 spoken sentences only. Natural English. Warm, professional.
-  • One question per turn. Never list more than two options.
-  • No menus, no bullet lists, no 'I can help with A, B, C, or D'.
-  • Never mention routing labels, internal tools, or system logic.
-  • If confidence is low after two attempts, offer specialist handoff.
-
-ROUTING (routing is restricted — most flows stay in lobby):
-  • should_route=true ONLY when visitor has confirmed AND magic_link is available.
-  • All other should_route decisions: false. Keep talking.
-  • route_target: none | magic_link
-  • intent: open-account | account-help | documents | general | clarify
-  • confidence: 0.0–1.0"""
-
-
-def _normalize_frontdesk_decision(
-    decision: FrontDeskResponse,
-    payload: FrontDeskRequest,
-) -> FrontDeskResponse:
-    reply_lower = decision.reply.lower()
-
-    if any(
-        phrase in reply_lower
-        for phrase in (
-            "would you like",
-            "do you want",
-            "shall i",
-            "are you ready",
-            "can i take you",
-            "should i open",
-        )
-    ):
-        decision.should_route = False
-        if decision.route_target != "none":
-            decision.route_target = "none"
-
-    if decision.route_target == "magic_link" and not payload.has_magic_link:
-        decision.route_target = "login"
-    if decision.should_route and decision.route_target == "none":
-        decision.should_route = False
-
-    return decision
-
-
-# ── Endpoint ──────────────────────────────────────────────────────────────────
-
-@router.post("/query", response_model=QueryResponse)
-def agent_query(
-    payload: QueryRequest,
-    authorization: Annotated[str | None, Header()] = None,
-) -> QueryResponse:
-    """Run the banking agent and return a natural-language answer.
-
-    Features:
-    - Contextual Query Rewriting (CQR): messy speech → clean query
-    - Multi-turn memory: conversation history informs follow-ups
-    - Authenticated: full banking tools scoped to the user
-    - Unauthenticated: general banking assistant (no tools)
+    Handles:
+      "2 2 2 4"           → "2224"
+      "2, 2, 2, 4"        → "2224"
+      "two two two four"  → "2224"
+      "2224"              → "2224"
+      "two-two-two-four"  → "2224"
     """
-    timer = _Timer()
-    log.info("\n" + "═" * 60)
-    log.info("🤖 AGENT QUERY  robot=%s  history=%d", payload.robot_name, len(payload.history))
-    log.info("   User: %r", payload.question)
-    log.info("═" * 60)
+    cleaned = text.lower().replace(",", " ").replace("-", " ").replace(".", " ")
+    digits: list[str] = []
+    for token in cleaned.split():
+        if token.isdigit():
+            digits.extend(list(token))          # "2224" → ["2","2","2","4"]
+        elif token in _WORD_TO_DIGIT:
+            digits.append(_WORD_TO_DIGIT[token])
+    return "".join(digits)
 
-    if not settings.openai_api_key:
-        raise HTTPException(status_code=503, detail="OpenAI key not configured")
 
-    system_prompt = _ROBOT_SYSTEM.get(payload.robot_name.upper(), DEFAULT_SYSTEM)
+def _extract_pin(text: str, llm: ChatOpenAI) -> str | None:
+    """Extract a 4-digit PIN from a Whisper transcript.
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        api_key=settings.openai_api_key,
+    1. Fast deterministic normalizer — covers 95 % of Whisper variants.
+    2. LLM fallback — catches compound numbers ("twenty-two twenty-four").
+    Returns None if neither pass produces exactly 4 digits.
+    """
+    # Pass 1: deterministic (zero latency)
+    normalized = _normalize_pin(text)
+    if len(normalized) == 4 and normalized.isdigit():
+        log.info("   🔢 PIN normalizer: %r → %s", text[:40], normalized)
+        return normalized
+
+    # Pass 2: LLM fallback for compound / unusual spoken forms
+    _PIN_PROMPT = (
+        "The user said their 4-digit bank PIN. "
+        "Whisper ASR may use words, digits, commas, or compound numbers. "
+        "Extract exactly 4 digits. "
+        "Return ONLY the 4 digits (e.g. 2224). If impossible, return NONE."
     )
+    try:
+        result = llm.invoke([
+            SystemMessage(content=_PIN_PROMPT),
+            HumanMessage(content=f'Transcript: "{text}"'),
+        ])
+        raw = (result.content or "").strip().replace(" ", "").replace(",", "").replace("-", "")
+        if raw.isdigit() and len(raw) == 4:
+            log.info("   🔢 LLM PIN fallback: %r → %s", text[:40], raw)
+            return raw
+    except Exception as e:
+        log.warning("PIN LLM fallback failed: %s", e)
 
-    # ── Step 1: Contextual Query Rewriting ────────────────────────────────
-    clean_query = _rewrite_query(payload.question, payload.history, llm)
-    timer.mark("cqr")
-
-    # ── Step 2: Build conversation history as LangChain messages ─────────
-    history_messages: list[HumanMessage | AIMessage] = []
-    for turn in payload.history[-10:]:  # cap at last 10 turns
-        if turn.role == "user":
-            history_messages.append(HumanMessage(content=turn.text))
-        else:
-            history_messages.append(AIMessage(content=turn.text))
-    log.info("📜 History: %d turns loaded", len(history_messages))
-
-    # ── Step 3: Try to authenticate ──────────────────────────────────────
-    tools: list = []
-    if authorization and authorization.lower().startswith("bearer "):
-        try:
-            user_id = get_current_user_id(authorization)
-            sb = get_supabase()
-            tools = _make_tools(user_id, sb)
-            log.info("🔐 Auth: user=%s  tools=%d", user_id[:8] + "…", len(tools))
-        except HTTPException:
-            log.info("🔓 Auth: token invalid — running without tools")
-    else:
-        log.info("🔓 Auth: no token — running without tools")
-
-    # ── Step 4: Run agent or direct LLM (wrapped for LangSmith) ─────────────
-    @traceable(
-        name=f"[{payload.robot_name}] {payload.question[:60]}",
-        run_type="chain",
-        tags=["banking", "agent", "authenticated" if tools else "guest"],
-        metadata={
-            "robot": payload.robot_name,
-            "question": payload.question,
-            "rewritten_query": clean_query,
-            "authenticated": bool(tools),
-            "tool_count": len(tools),
-        },
-    )
-    def _run_agent() -> str:
-        if tools:
-            tool_names = [t.name for t in tools]
-            log.info("🛠️  Tools available: %s", ", ".join(tool_names))
-            agent = create_react_agent(llm, tools, prompt=system_prompt)
-            all_messages = history_messages + [HumanMessage(content=clean_query)]
-            result = agent.invoke({"messages": all_messages})
-            tool_calls = [
-                msg for msg in result["messages"]
-                if hasattr(msg, "tool_calls") and msg.tool_calls
-            ]
-            if tool_calls:
-                for tc_msg in tool_calls:
-                    for tc in tc_msg.tool_calls:
-                        log.info("   🔧 Tool called: %s(%s)", tc["name"], str(tc.get("args", ""))[:80])
-            return result["messages"][-1].content
-        else:
-            log.info("💬 Mode: Direct LLM (no tools)")
-            general_prompt = (
-                system_prompt
-                + " The visitor has not signed in yet, so you cannot access any "
-                "account data. Help with general banking questions, guide them to "
-                "sign in or open an account, and answer questions about BankBot "
-                "Vision services. Keep answers concise."
-            )
-            all_messages = (
-                [SystemMessage(content=general_prompt)]
-                + history_messages
-                + [HumanMessage(content=clean_query)]
-            )
-            result = llm.invoke(all_messages)
-            return result.content
-
-    answer = _run_agent()
-    timer.mark("llm_done")
-    timer.log(log, "AGENT_QUERY")
-    log.info("✅ ANSWER: %s", answer[:120] + ("…" if len(answer) > 120 else ""))
-    log.info("─" * 60)
-
-    return QueryResponse(
-        answer=answer,
-        rewritten_query=clean_query if clean_query != payload.question else None,
-    )
+    log.info("   🔢 PIN extraction failed for: %r", text[:40])
+    return None
 
 
-@traceable(
-    name="Frontdesk Conversation Turn",
-    run_type="chain",
-    tags=["frontdesk", "lobby"],
-)
-def _frontdesk_llm_call(payload: FrontDeskRequest) -> FrontDeskResponse:
-    """Intent triage → auth gate → optional CQR → module LLM → normalize."""
-    timer = _Timer()
+def _verify_pin_db(sb: Client, user_id: str, candidate: str) -> str:
+    """Check candidate PIN against the database.
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.15,
-        api_key=settings.openai_api_key,
-    )
+    Returns:
+        "ok"       — PIN matches
+        "no_pin"   — no PIN set in the account
+        "mismatch" — PIN set but does not match
+        "error"    — DB lookup failed
+    """
+    try:
+        res = sb.table("accounts").select("pin").eq("user_id", user_id).maybe_single().execute()
+        stored = (res.data or {}).get("pin")
+        if not stored:
+            log.info("   ⚠️  No PIN stored for user")
+            return "no_pin"
+        match = stored.strip() == candidate.strip()
+        log.info("   🔐 PIN compare: %s", "match" if match else "mismatch")
+        return "ok" if match else "mismatch"
+    except Exception as e:
+        log.warning("PIN DB lookup failed: %s", e)
+        return "error"
 
-    # ── Step 1: Fast keyword intent + risk classification (no LLM) ───────────
-    intent_module, risk_level = _classify_intent(payload.utterance)
-    timer.mark("intent")
-    log.info("   🎯 Module: %s  Risk: %s", intent_module, risk_level)
 
-    # ── Step 2: Auth gate — deflect without LLM if auth is insufficient ──────
-    gate = _auth_gate(risk_level, payload)
-    if gate:
-        timer.mark("auth_gate")
-        timer.log(log, "FRONTDESK")
-        return gate
+# ── Contextual Query Rewriting (fixes Whisper errors) ────────────────────────
 
-    # ── Step 3: Clarification limit — offer specialist after 2 retries ───────
-    if payload.clarification_count >= 2 and intent_module == "general":
-        timer.log(log, "FRONTDESK")
-        return FrontDeskResponse(
-            summary="Repeated clarification failure — escalate.",
-            reply="I want to make sure I get this right for you. Would you like to speak with a specialist who can help directly?",
-            intent="clarify",
-            confidence=0.4,
-            escalate=True,
-            risk_level=risk_level,
-            intent_module="escalation",
-            clarification_count=payload.clarification_count,
+_CQR_PROMPT = """You are a speech cleanup module at a bank teller kiosk.
+The transcript was produced by Whisper ASR and may contain errors, filler words, or fragments.
+
+Common ASR errors to fix:
+- "checking" often means "chequing"
+- garbled phrases ("gonna get too old") often mean the visitor trailed off — return as-is
+- resolve pronouns using conversation history ("the other one" → "savings account")
+
+Rules:
+1. Return ONE clean sentence matching the visitor's true intent.
+2. Do NOT invent new requests — only rewrite what they actually said.
+3. If the input is already clear, return it unchanged.
+4. If the input is genuinely unreadable, return it unchanged (do not guess).
+5. Output only the cleaned sentence. No preamble, no explanation.
+"""
+
+
+@traceable(name="CQR Compression", run_type="llm", tags=["cqr"])
+def _compress_utterance(text: str, history: list[DeskMessage], llm: ChatOpenAI) -> str:
+    """Clean up Whisper ASR errors and resolve context. Skip for short utterances."""
+    words = text.split()
+    if len(words) <= 6:
+        return text
+    history_text = "\n".join(f"{m.role.upper()}: {m.text}" for m in history[-4:]) or "First turn."
+    try:
+        result = llm.invoke(
+            [
+                SystemMessage(content=_CQR_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"Recent conversation:\n{history_text}\n\n"
+                        f"Visitor said:\n\"{text}\"\n\n"
+                        f"Cleaned sentence:"
+                    )
+                ),
+            ],
+            config={"run_name": f"CQR: {text[:40]}"},
         )
+        cleaned = (result.content or "").strip().strip('"').strip()
+        if cleaned and len(cleaned) < len(text) * 2:
+            return cleaned
+    except Exception as e:
+        log.warning("CQR failed: %s", e)
+    return text
 
-    # ── Step 4: Optional CQR — skip for short utterances ────────────────────
-    clean_utterance = _compress_utterance(payload.utterance, payload.history, llm)
+
+# ── Auth challenge / PIN mismatch replies (deterministic, no LLM) ────────────
+
+def _auth_challenge_reply(intent: str, payload: FrontDeskRequest) -> FrontDeskResponse:
+    name_part = f", {payload.recognised_name}" if payload.recognised_name else ""
+    if payload.has_face_match:
+        reply = (
+            f"To do that{name_part}, I need to verify your PIN. "
+            "Please say your four-digit PIN."
+        )
+    else:
+        reply = "I'll need to verify who you are first. Can you look at the camera?"
+    return FrontDeskResponse(
+        summary=f"Auth required for {intent}",
+        reply=reply,
+        intent=intent,
+        intent_module=intent,
+        confidence=0.9,
+        risk_level="high",
+        pin_verified=False,
+    )
+
+
+def _pin_fail_reply(reason: str) -> FrontDeskResponse:
+    if reason == "no_pin":
+        reply = (
+            "It looks like you haven't set a PIN on your account yet. "
+            "Please visit your account settings and set a four-digit PIN, then come back."
+        )
+    elif reason == "mismatch":
+        reply = "That PIN doesn't match. Please try again."
+    else:
+        reply = "I had trouble checking your PIN. Please try again in a moment."
+    return FrontDeskResponse(
+        summary=f"PIN fail: {reason}",
+        reply=reply,
+        intent="pin_verify",
+        intent_module="pin_verify",
+        confidence=0.95,
+        risk_level="high",
+        pin_verified=False,
+    )
+
+
+# ── Main turn handler ────────────────────────────────────────────────────────
+
+def _build_context_hint(
+    payload: FrontDeskRequest,
+    intent: str,
+    risk: str,
+    effective_pin_verified: bool,
+    pin_just_verified: bool,
+) -> str:
+    name_line = (
+        f"- Customer: {payload.recognised_name} (face recognised)"
+        if payload.recognised_name else "- Customer: unknown (not yet identified by face)"
+    )
+    lines = [
+        "",
+        "SESSION CONTEXT:",
+        name_line,
+        f"- Face match: {payload.has_face_match}",
+        f"- PIN verified: {effective_pin_verified}",
+        f"- Detected intent: {intent} (risk: {risk})",
+    ]
+    if pin_just_verified:
+        if payload.pending_query:
+            lines.append(
+                f'- DEFERRED REQUEST: Before verifying their PIN, the customer asked: "{payload.pending_query}". '
+                "Open with something like: \"You mentioned [topic] earlier — let me pull that up for you.\" "
+                "Then call the right tool and give the real answer. Warm and natural, not robotic."
+            )
+        else:
+            lines.append(
+                "- PIN just verified. Warmly acknowledge and ask what they need, or answer their last question."
+            )
+    lines.append("")
+    lines.append("Speak in 1–2 natural sentences. Use tools to look up real data — never guess.")
+    return "\n".join(lines)
+
+
+@traceable(name="Frontdesk Turn", run_type="chain", tags=["frontdesk", "lobby"])
+def _run_frontdesk_turn(payload: FrontDeskRequest) -> FrontDeskResponse:
+    timer = _Timer()
+    log.info(
+        "🏦 Frontdesk | robot=%s recognised=%s face=%s pin=%s",
+        payload.robot_name,
+        payload.recognised_name,
+        payload.has_face_match,
+        payload.pin_verified,
+    )
+    log.info("   Raw: %r", payload.utterance)
+
+    # 1. Keyword intent classification (fast, deterministic)
+    intent, risk = _classify_intent(payload.utterance)
+    timer.mark("intent")
+    log.info("   Intent: %s (risk=%s)", intent, risk)
+
+    # Fast LLM for CQR, main LLM for response
+    llm_small = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, api_key=settings.openai_api_key)
+    llm_main = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, api_key=settings.openai_api_key)
+    sb = get_supabase()
+
+    # 3. PIN extraction & verification
+    # Trigger whenever the frontend tells us the user is in PIN-entry mode
+    # (auth_state=confirmed, pin not yet verified). No history parsing needed.
+    in_pin_mode = payload.auth_state == "confirmed" and not payload.pin_verified
+
+    # 2. CQR — skip entirely when collecting a PIN (raw digits are better)
+    if in_pin_mode:
+        clean_utterance = payload.utterance
+    else:
+        clean_utterance = _compress_utterance(payload.utterance, payload.history, llm_small)
+        if clean_utterance != payload.utterance:
+            log.info("   Cleaned: %r", clean_utterance)
     timer.mark("cqr")
-    if clean_utterance != payload.utterance:
-        log.info("   🗜️  Compressed: %r → %r", payload.utterance[:60], clean_utterance[:60])
+    pin_candidate = _extract_pin(clean_utterance, llm_small) if in_pin_mode else None
+    pin_just_verified = False
+    effective_pin_verified = payload.pin_verified
 
-    # ── Step 5: LLM structured output with module-specific prompt ────────────
-    module_guidance = _MODULE_PROMPTS.get(intent_module, _MODULE_PROMPTS["general"])
-    system_content = _frontdesk_system_prompt(payload.robot_name) + f"\n\n{module_guidance}"
-    structured_llm = llm.with_structured_output(FrontDeskResponse)
+    if pin_candidate and payload.user_id and not payload.pin_verified:
+        pin_result = _verify_pin_db(sb, payload.user_id, pin_candidate)
+        if pin_result == "ok":
+            pin_just_verified = True
+            effective_pin_verified = True
+            log.info("   🔐 PIN verified")
+            for msg in reversed(payload.history):
+                if msg.role == "visitor":
+                    pi, pr = _classify_intent(msg.text)
+                    if pi != "unknown":
+                        intent, risk = pi, pr
+                    break
+        else:
+            log.info("   ❌ PIN fail: %s", pin_result)
+            timer.log(log, "FRONTDESK")
+            return _pin_fail_reply(pin_result)
+    timer.mark("pin_check")
 
-    history_lines = "\n".join(
-        f"{msg.role.upper()}: {msg.text}" for msg in payload.history[-6:]
-    ) or "First turn."
+    # 4. Auth gate — face match requires PIN before ANY account data is shown
+    if payload.has_face_match and not effective_pin_verified and risk not in ("low",):
+        log.info("   🚫 Auth gate: face matched but PIN not yet verified")
+        timer.log(log, "FRONTDESK")
+        return _auth_challenge_reply(intent, payload)
+    if risk == "high" and not effective_pin_verified:
+        log.info("   🚫 Auth gate: high-risk needs PIN")
+        timer.log(log, "FRONTDESK")
+        return _auth_challenge_reply(intent, payload)
 
-    name_ctx = f"Recognised: {payload.recognised_name}." if payload.recognised_name else "Visitor unrecognised."
-    session_ctx = (
-        f"{name_ctx} Face match: {payload.has_face_match}. "
-        f"Magic link: {payload.has_magic_link}. Auth: {payload.auth_state}. "
-        f"Customer type: {payload.customer_type}. Risk: {risk_level}."
+    # 5. Tool availability — require PIN for account data tools
+    tools = []
+    if payload.user_id and payload.has_face_match and effective_pin_verified:
+        tools = _make_tools(payload.user_id, sb, can_execute=True)
+    log.info("   Tools: %d available (execute=%s)", len(tools), effective_pin_verified)
+
+    # 6. Build system prompt with context
+    base_prompt = _ROBOT_SYSTEM.get(payload.robot_name.upper(), DEFAULT_SYSTEM)
+    system_prompt = base_prompt + _build_context_hint(
+        payload, intent, risk, effective_pin_verified, pin_just_verified
     )
 
-    timer.mark("llm_start")
-    decision = structured_llm.invoke(
-        [
-            SystemMessage(content=system_content),
-            HumanMessage(
-                content=(
-                    f"Session:\n{session_ctx}\n\n"
-                    f"Recent turns:\n{history_lines}\n\n"
-                    f"Visitor:\n{clean_utterance}"
-                )
-            ),
-        ],
-        config={
-            "run_name": f"[{payload.robot_name}/{intent_module}] {clean_utterance[:55]}",
-            "metadata": {
-                "robot": payload.robot_name,
-                "visitor": payload.recognised_name or "guest",
-                "intent_module": intent_module,
-                "risk_level": risk_level,
-                "raw": payload.utterance,
-                "compressed": clean_utterance,
-                "auth_state": payload.auth_state,
-                "clarification_count": payload.clarification_count,
-            },
-        },
-    )
+    # 7. Build conversation history
+    history_messages = []
+    for msg in payload.history[-8:]:
+        if msg.role == "visitor":
+            history_messages.append(HumanMessage(content=msg.text))
+        else:
+            history_messages.append(AIMessage(content=msg.text))
+
+    # If PIN was just verified, replace the raw PIN digits with a clear instruction.
+    # Include the pending query (if any) so the LLM knows exactly what to answer.
+    if pin_just_verified:
+        if payload.pending_query:
+            current_msg = HumanMessage(
+                content=f"[PIN verified] My earlier question was: \"{payload.pending_query}\" — please answer it now."
+            )
+        else:
+            current_msg = HumanMessage(content="[PIN verified] Please answer my earlier question now.")
+    else:
+        current_msg = HumanMessage(content=clean_utterance)
+
+    # 8. Invoke — ReAct with tools, or direct LLM without
+    try:
+        if tools:
+            agent = create_react_agent(llm_main, tools, prompt=system_prompt)
+            result = agent.invoke({"messages": history_messages + [current_msg]})
+            # Log tool calls for debugging
+            for msg in result["messages"]:
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        log.info("   🔧 %s(%s)", tc["name"], str(tc.get("args", ""))[:80])
+            reply = result["messages"][-1].content.strip()
+        else:
+            all_msgs = [SystemMessage(content=system_prompt)] + history_messages + [current_msg]
+            result = llm_main.invoke(all_msgs)
+            reply = result.content.strip()
+    except Exception as e:
+        log.error("LLM failure: %s", e)
+        reply = "Sorry, I had trouble with that. Could you try again?"
+
     timer.mark("llm_done")
     timer.log(log, "FRONTDESK")
 
-    # Attach session state updates so frontend can echo them back
-    decision.risk_level = risk_level
-    decision.intent_module = intent_module
-    decision.clarification_count = (
-        payload.clarification_count + 1
-        if decision.intent == "clarify"
-        else 0  # reset counter on successful understanding
+    log.info("   💬 Reply: %s", reply[:120] + ("…" if len(reply) > 120 else ""))
+
+    return FrontDeskResponse(
+        summary=f"Intent: {intent}",
+        reply=reply,
+        intent=intent,
+        intent_module=intent,
+        confidence=0.85,
+        risk_level=risk,
+        pin_verified=effective_pin_verified,
+        clarification_count=0,
     )
-    return _normalize_frontdesk_decision(decision, payload)
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+@router.post("/query", response_model=QueryResponse)
+def agent_query(payload: QueryRequest, authorization: Annotated[str | None, Header()] = None) -> QueryResponse:
+    """Authenticated banking agent with full tool access (used after login)."""
+    if not settings.openai_api_key:
+        raise HTTPException(status_code=503, detail="OpenAI key not configured")
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=settings.openai_api_key)
+    history_messages = [
+        HumanMessage(content=t.text) if t.role == "user" else AIMessage(content=t.text)
+        for t in payload.history[-10:]
+    ]
+
+    user_id = None
+    if authorization and authorization.lower().startswith("bearer "):
+        try:
+            user_id = get_current_user_id(authorization)
+        except Exception:
+            pass
+
+    tools = _make_tools(user_id, get_supabase(), can_execute=True) if user_id else []
+    system_prompt = _ROBOT_SYSTEM.get(payload.robot_name.upper(), DEFAULT_SYSTEM)
+
+    if tools:
+        agent = create_react_agent(llm, tools, prompt=system_prompt)
+        result = agent.invoke({"messages": history_messages + [HumanMessage(content=payload.question)]})
+        answer = result["messages"][-1].content
+    else:
+        result = llm.invoke(
+            [SystemMessage(content=system_prompt)] + history_messages + [HumanMessage(content=payload.question)]
+        )
+        answer = result.content
+
+    return QueryResponse(answer=answer)
 
 
 @router.post("/frontdesk", response_model=FrontDeskResponse)
 def frontdesk_query(payload: FrontDeskRequest) -> FrontDeskResponse:
-    """Understand a spoken lobby request and decide whether to keep talking or route."""
-    log.info("\n" + "═" * 60)
-    log.info("🏦 FRONTDESK  robot=%s  recognised=%s", payload.robot_name, payload.recognised_name or "none")
-    log.info("   Visitor said: %r", payload.utterance)
-    log.info("═" * 60)
-
-    fallback = _fallback_frontdesk_response(payload)
-
+    """Lobby front-desk turn: CQR → auth gate → ReAct agent with tools."""
     if not settings.openai_api_key:
-        log.info("   ⚠️  No OpenAI key — using keyword fallback")
-        return fallback
-
+        return FrontDeskResponse(
+            summary="OpenAI key missing",
+            reply="I'm having trouble connecting right now. Please try again shortly.",
+            intent="general",
+        )
     try:
-        result = _frontdesk_llm_call(payload)
-        log.info("   🎯 Decision: route=%s  should_route=%s", result.route_target, result.should_route)
-        log.info("   💬 Reply: %r", result.reply[:100])
-        log.info("─" * 60)
-        return result
+        return _run_frontdesk_turn(payload)
     except Exception as e:
-        log.warning("   ❌ Frontdesk LLM failed: %s — using fallback", e)
-        return fallback
+        log.exception("Frontdesk failure: %s", e)
+        return FrontDeskResponse(
+            summary="Pipeline error",
+            reply="Sorry, something went wrong on my end. Could you try that again?",
+            intent="general",
+        )

@@ -9,6 +9,7 @@ export type Account = {
   credit_balance: string;
   credit_limit: string;
   credit_score: number | null;
+  has_pin: boolean;
   last_login_at: string | null;
   last_login_loc: string | null;
   face_image_path: string | null;
@@ -26,6 +27,7 @@ export type AccountCreate = {
   credit_balance?: number;
   credit_limit?: number;
   credit_score?: number | null;
+  pin?: string | null;
 };
 
 export type AccountUpdate = Partial<AccountCreate>;

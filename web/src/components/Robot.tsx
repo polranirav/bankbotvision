@@ -105,27 +105,11 @@ export type RobotDef = {
 export const ROBOTS: RobotDef[] = [
   {
     name: "ARIA",
-    color: "#2563eb",
-    eyeColor: "#93c5fd",
+    color: "#0088ff",
+    eyeColor: "#00e5ff",
     personality: "Friendly & Helpful",
     voiceId: "21m00Tcm4TlvDq8ikWAM",
-    greeting: "Hi there! I'm ARIA. Welcome to BankBot Vision. I'm here to help you with all your banking needs. Shall I verify who you are?",
-  },
-  {
-    name: "MAX",
-    color: "#16a34a",
-    eyeColor: "#86efac",
-    personality: "Fast & Precise",
-    voiceId: "AZnzlk1XvdvUeBnXmlld",
-    greeting: "Welcome. I'm MAX. Ready to assist you. Let me quickly verify your identity and we can get started.",
-  },
-  {
-    name: "ZED",
-    color: "#7c3aed",
-    eyeColor: "#c4b5fd",
-    personality: "Calm & Analytical",
-    voiceId: "EXAVITQu4vr4xnSDxMaL",
-    greeting: "Good day. I'm ZED. Please allow me a moment to verify who you are, and I'll have everything ready for you.",
+    greeting: "Hi there! How can I help you today?",
   },
 ];
 
@@ -232,7 +216,7 @@ export function Robot({
   });
 
   const mat = (color: THREE.Color) => (
-    <meshStandardMaterial color={color} roughness={0.3} metalness={0.6} />
+    <meshStandardMaterial color={color} roughness={0.1} metalness={0.92} />
   );
 
   const eyeIntensity = (hovered || active) ? 3.5 : speaking ? 2.5 : 1.5;
@@ -398,37 +382,37 @@ type DeskProps = {
 
 export function Desk({ position, color, active = false, activity = "waiting" }: DeskProps) {
   const accentColor = new THREE.Color(color);
-  const deskColor   = new THREE.Color(active ? "#2d3748" : "#1e2533");
-  const legColor    = new THREE.Color("#111827");
+  const deskColor   = new THREE.Color(active ? "#1a2540" : "#0d1628");
+  const legColor    = new THREE.Color("#080c18");
   const screenColor =
     activity === "typing"
-      ? "#1d4ed8"
+      ? "#003399"
       : activity === "busy"
-        ? "#7c2d12"
+        ? "#4c1800"
         : active
-          ? "#1e3a5f"
-          : "#111";
+          ? "#001f4d"
+          : "#060618";
   const glowOpacity =
     activity === "typing"
-      ? 1.15
+      ? 2.2
       : activity === "busy"
-        ? 0.95
+        ? 1.8
         : active
-          ? 1.2
-          : 0.4;
+          ? 2.8
+          : 1.5;
 
   return (
     <group position={position}>
       {/* Desktop surface */}
       <mesh position={[0, 0, 0]}>
         <boxGeometry args={[2.2, 0.08, 1.1]} />
-        <meshStandardMaterial color={deskColor} roughness={0.4} metalness={0.3} />
+        <meshStandardMaterial color={deskColor} roughness={0.15} metalness={0.8} />
       </mesh>
 
-      {/* Accent trim strip on front edge */}
+      {/* Accent trim strip on front edge — neon glow */}
       <mesh position={[0, 0.02, 0.52]}>
         <boxGeometry args={[2.2, 0.06, 0.04]} />
-        <meshStandardMaterial color={accentColor} emissive={accentColor} emissiveIntensity={active ? 0.8 : 0.3} />
+        <meshStandardMaterial color={accentColor} emissive={accentColor} emissiveIntensity={active ? 4.0 : 2.0} />
       </mesh>
 
       {/* Small monitor on desk */}
@@ -481,31 +465,31 @@ export function Desk({ position, color, active = false, activity = "waiting" }: 
       {/* Keyboard / laptop base */}
       <mesh position={[0, 0.05, -0.02]}>
         <boxGeometry args={[0.62, 0.035, 0.22]} />
-        <meshStandardMaterial color="#334155" metalness={0.6} roughness={0.35} />
+        <meshStandardMaterial color="#0a0e1e" metalness={0.85} roughness={0.15} />
       </mesh>
 
-      {/* Small mug or desk accessory */}
-      <mesh position={[0.62, 0.08, 0.02]}>
-        <cylinderGeometry args={[0.07, 0.07, 0.12, 16]} />
-        <meshStandardMaterial color={activity === "busy" ? "#f59e0b" : "#e5e7eb"} roughness={0.5} />
+      {/* Holographic desk accessory — cyan cylinder */}
+      <mesh position={[0.62, 0.1, 0.02]}>
+        <cylinderGeometry args={[0.055, 0.055, 0.14, 16]} />
+        <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={0.6} transparent opacity={0.7} roughness={0.1} metalness={0.5} />
       </mesh>
-      <mesh position={[0.7, 0.08, 0.02]} rotation={[Math.PI / 2, 0, 0]}>
-        <torusGeometry args={[0.03, 0.01, 10, 18]} />
-        <meshStandardMaterial color="#cbd5e1" />
+      <mesh position={[0.62, 0.17, 0.02]}>
+        <cylinderGeometry args={[0.03, 0.055, 0.02, 16]} />
+        <meshStandardMaterial color="#00e5ff" emissive="#00e5ff" emissiveIntensity={1.5} transparent opacity={0.5} depthWrite={false} />
       </mesh>
 
-      {/* Name plate on desk front */}
+      {/* Name plate — bright neon */}
       <mesh position={[0, 0.06, 0.42]}>
         <boxGeometry args={[0.55, 0.1, 0.02]} />
-        <meshStandardMaterial color={accentColor} emissive={accentColor} emissiveIntensity={0.5} />
+        <meshStandardMaterial color={accentColor} emissive={accentColor} emissiveIntensity={3.0} />
       </mesh>
 
-      {/* 4 legs */}
+      {/* 4 legs — dark chrome */}
       {([-0.9, 0.9] as number[]).map((lx) =>
         ([-0.35, 0.35] as number[]).map((lz) => (
           <mesh key={`${lx}-${lz}`} position={[lx, -0.42, lz]}>
             <boxGeometry args={[0.08, 0.76, 0.08]} />
-            <meshStandardMaterial color={legColor} metalness={0.7} roughness={0.3} />
+            <meshStandardMaterial color={legColor} metalness={0.92} roughness={0.08} />
           </mesh>
         ))
       )}
@@ -513,22 +497,27 @@ export function Desk({ position, color, active = false, activity = "waiting" }: 
       {/* Chair seat */}
       <mesh position={[0, -0.72, -0.7]}>
         <boxGeometry args={[0.7, 0.08, 0.65]} />
-        <meshStandardMaterial color="#1f2937" roughness={0.8} />
+        <meshStandardMaterial color="#0a0d1a" roughness={0.5} metalness={0.4} />
       </mesh>
       {/* Chair back */}
       <mesh position={[0, -0.35, -0.99]}>
         <boxGeometry args={[0.68, 0.72, 0.07]} />
-        <meshStandardMaterial color="#1f2937" roughness={0.8} />
+        <meshStandardMaterial color="#0a0d1a" roughness={0.5} metalness={0.4} />
+      </mesh>
+      {/* Chair back neon trim */}
+      <mesh position={[0, -0.0, -0.96]}>
+        <boxGeometry args={[0.68, 0.02, 0.02]} />
+        <meshStandardMaterial color={accentColor} emissive={accentColor} emissiveIntensity={1.5} />
       </mesh>
       {/* Chair pole */}
       <mesh position={[0, -1.0, -0.7]}>
         <cylinderGeometry args={[0.04, 0.04, 0.56, 8]} />
-        <meshStandardMaterial color="#374151" metalness={0.8} />
+        <meshStandardMaterial color="#12141e" metalness={0.9} roughness={0.1} />
       </mesh>
       {/* Chair base */}
       <mesh position={[0, -1.28, -0.7]} rotation={[0, Math.PI / 4, 0]}>
         <cylinderGeometry args={[0.38, 0.38, 0.04, 5]} />
-        <meshStandardMaterial color="#374151" metalness={0.7} />
+        <meshStandardMaterial color="#12141e" metalness={0.85} roughness={0.15} />
       </mesh>
     </group>
   );

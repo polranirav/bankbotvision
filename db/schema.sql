@@ -22,6 +22,7 @@ create table if not exists accounts (
   credit_score     int check (credit_score is null or credit_score between 300 and 900),
   last_login_at    timestamptz,
   last_login_loc   text,
+  pin              varchar(4),
   face_descriptor  real[],          -- populated in Phase 2 (128-dim face-api.js vector)
   face_image_path  text,            -- Supabase Storage path, populated in Phase 2
   created_at       timestamptz not null default now(),
